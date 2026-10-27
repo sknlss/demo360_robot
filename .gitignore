@@ -1,0 +1,21 @@
+# секреты и локальные настройки
+.env
+compose.override.yml
+
+# база, замок и кеш фотографий
+data/
+*.db
+*.db-wal
+*.db-shm
+*.lock
+photos/
+
+# мусор
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+tests/_preview.html

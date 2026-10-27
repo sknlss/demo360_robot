@@ -1,0 +1,15 @@
+# Одна служба. Порт НЕ публикуется: привязку делайте в compose.override.yml, например
+#   services:
+#     bot:
+#       ports: ["127.0.0.1:8080:8080"]
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WEB_HOST: 0.0.0.0          # внутри контейнера слушаем все интерфейсы; наружу открывает override
+      DB_PATH: /app/data/bot.db
+    volumes:
+      - ./data:/app/data
+      - ./funnels.yml:/app/funnels.yml:ro

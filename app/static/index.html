@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Дашборд воронки</title>
+<style>
+  :root { --bg:#f4f5f7; --card:#fff; --text:#1c1e21; --muted:#6b7280; --line:#e5e7eb;
+          --accent:#2481cc; --ok:#1a7f4b; --warn:#b45309; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111418; --card:#1b1f26; --text:#e8eaed; --muted:#9aa3af; --line:#2a303a;
+            --accent:#5aa9e6; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.4 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 12px 12px 32px; }
+  h1 { font-size: 19px; margin: 6px 0 12px; }
+  h2 { font-size: 15px; margin: 22px 0 8px; color: var(--muted); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .04em; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  .levels { display: grid; gap: 8px; }
+  button.level { all: unset; box-sizing: border-box; cursor: pointer; width: 100%;
+         display: flex; align-items: center; justify-content: space-between; gap: 12px;
+         padding: 14px 16px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  button.level:active { background: var(--line); }
+  .level .n { font-size: 26px; font-weight: 700; }
+  .level .t { color: var(--muted); }
+  .level .bar { height: 4px; background: var(--accent); border-radius: 2px; margin-top: 6px; opacity: .6; }
+  .level .l { flex: 1; min-width: 0; }
+  .level .chev { color: var(--muted); font-size: 20px; }
+  .step { padding: 12px 14px; margin-bottom: 8px; }
+  .step .name { font-weight: 600; word-break: break-word; }
+  .step .fun { color: var(--muted); font-size: 13px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip { padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); font-size: 13px; }
+  .chip b { font-weight: 700; }
+  .chip.sent b { color: var(--ok); } .chip.expired b { color: var(--warn); } .chip.error b { color: var(--bad); }
+  .note { color: var(--muted); font-size: 13px; margin-top: 6px; }
+  .ev { display: flex; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--line); }
+  .ev:last-child { border-bottom: 0; }
+  .ev .time { color: var(--muted); font-size: 12px; white-space: nowrap; min-width: 78px; }
+  .ev .body { min-width: 0; overflow-wrap: anywhere; }
+  .ev .kind { font-weight: 600; }
+  .ev .kind.bad { color: var(--bad); } .ev .kind.warn { color: var(--warn); } .ev .kind.ok { color: var(--ok); }
+  .ev .who, .ev .det { color: var(--muted); font-size: 13px; }
+  .u { display: flex; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+  .u:last-child { border-bottom: 0; }
+  .ava { width: 44px; height: 44px; border-radius: 50%; flex: none; background: var(--line);
+         display: grid; place-items: center; font-weight: 700; color: var(--muted); overflow: hidden; }
+  .ava img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .u .info { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+  .u .nm { font-weight: 600; }
+  .u .sub { color: var(--muted); font-size: 13px; }
+  a { color: var(--accent); text-decoration: none; }
+  .back { all: unset; cursor: pointer; color: var(--accent); padding: 6px 0; display: inline-block; }
+  .empty, .err { padding: 18px 14px; color: var(--muted); text-align: center; }
+  .err { color: var(--bad); }
+  .top { display: flex; justify-content: space-between; align-items: center; }
+  .refresh { all: unset; cursor: pointer; color: var(--accent); font-size: 14px; padding: 6px 0; }
+  .tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin: 4px 0 14px;
+          background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  .tab { all: unset; box-sizing: border-box; cursor: pointer; text-align: center; padding: 10px 6px;
+         border-radius: 9px; font-weight: 600; color: var(--muted); }
+  .tab[aria-selected="true"] { background: var(--accent); color: #fff; }
+  .btn { all: unset; box-sizing: border-box; cursor: pointer; display: block; text-align: center; width: 100%;
+         padding: 11px 14px; border-radius: 10px; border: 1px solid var(--accent); color: var(--accent); font-weight: 600; }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn:active { opacity: .7; }
+  .rowlink { all: unset; box-sizing: border-box; cursor: pointer; width: 100%; display: flex; align-items: center;
+             gap: 12px; padding: 14px 16px; margin-bottom: 8px; background: var(--card);
+             border: 1px solid var(--line); border-radius: 12px; }
+  .rowlink .l { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .rowlink .nm { font-weight: 600; }
+  .rowlink .sub { color: var(--muted); font-size: 13px; }
+  .rowlink .chev { color: var(--muted); font-size: 20px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; background: var(--line); color: var(--muted);
+           font-size: 12px; font-weight: 600; vertical-align: middle; }
+  .snip { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 14px; text-align: center; }
+  .snip .n { font-size: 24px; font-weight: 700; }
+  .snip .t { color: var(--muted); font-size: 12px; }
+  .snipfoot { padding: 0 14px 14px; }
+  .snipfoot .note { margin: 0 0 10px; }
+  .flow > * + * { margin-top: 8px; }
+  .sc { padding: 12px 14px; }
+  .sc.editable { cursor: pointer; }
+  .sc.editable:active { background: var(--line); }
+  .sc .head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .sc .key { font-weight: 700; word-break: break-all; }
+  .sc .kind { font-size: 12px; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0 8px; }
+  .sc .delay { margin-left: auto; font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .sc .text { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .sc .meta { margin-top: 8px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+  .sc .meta b { color: var(--text); font-weight: 600; }
+  .sc .btnline { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .sc .kb { padding: 3px 10px; border-radius: 8px; background: var(--line); font-size: 13px; }
+  .sc .kb.no { opacity: .75; }
+  .more { padding: 12px; text-align: center; color: var(--muted); font-size: 13px; }
+  .gap { height: 10px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <div id="error" class="card err" hidden></div>
+
+  <section id="v-home">
+    <div class="top"><h1>Бот-воронка</h1><button class="refresh" id="refresh">Обновить</button></div>
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" id="tab-funnels" data-tab="funnels">Воронки</button>
+      <button class="tab" role="tab" id="tab-users" data-tab="users">Пользователи</button>
+    </div>
+    <div id="home-body"></div>
+  </section>
+
+  <section id="v-sub" hidden>
+    <button class="back" id="back">← Назад</button>
+    <h1 id="sub-title"></h1>
+    <div id="sub-body"></div>
+  </section>
+</main>
+<script>
+(function () {
+  // Telegram передаёт подписанные данные в хеше ссылки (tgWebAppData). Читаем один раз и адрес больше не трогаем:
+  // переходы между экранами идут в памяти (свой стек «Назад»), иначе подпись пропала бы из адреса и после
+  // обновления страницы сервер ответил бы 403.
+  var initData = new URLSearchParams(location.hash.slice(1)).get("tgWebAppData") || "";
+  var $ = function (id) { return document.getElementById(id); };
+  var KINDS = {
+    run_started: ["Запустил бота", ""], phone_requested: ["Получил запрос номера", ""],
+    phone_given: ["Дал телефон", "ok"],
+    phone_declined: ["Отказался от телефона", "warn"], message_sent: ["Получил сообщение", "ok"],
+    send_failed: ["Ошибка отправки", "bad"], run_cancelled: ["Прогон отменён", "warn"],
+    run_completed: ["Прогон завершён", "ok"], step_expired: ["Шаг просрочен", "warn"],
+    start_blocked: ["Повторный старт: номер уже оставлен", ""]
+  };
+  var STAT = [["sent", "отправлено"], ["cancelled", "отменено"], ["expired", "просрочено"],
+              ["error", "ошибок"], ["pending", "ждут"], ["processing", "в работе"]];
+  var OUTCOMES = { contact: "прислал номер", decline: "отказ" };
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  // Пути БЕЗ ведущей «/»: страница может лежать не в корне домена (например /tg-demo/), адрес считается от неё
+  function api(path) {
+    return fetch(path, { headers: { "X-Init-Data": initData } });
+  }
+  function getJson(path) {
+    return api(path).then(function (r) {
+      if (!r.ok) throw new Error(r.status === 403
+        ? "Доступ закрыт: дашборд открывается только из Telegram (нужна подпись Telegram)." : "Ошибка " + r.status);
+      return r.json();
+    });
+  }
+  function fmt(ts) {
+    var d = new Date(ts * 1000), now = new Date();
+    var t = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    return d.toDateString() === now.toDateString() ? t :
+      d.toLocaleDateString("ru-RU", { day: "2-digit", month: "2-digit" }) + " " + t;
+  }
+  function fmtDelay(sec) {
+    if (!sec) return "сразу";
+    var parts = [], h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = Math.round(sec % 60 * 10) / 10;
+    if (h) parts.push(h + " ч");
+    if (m) parts.push(m + " мин");
+    if (s) parts.push(s + " с");
+    return "через " + parts.join(" ");
+  }
+  function showError(msg) { var e = $("error"); e.textContent = msg || ""; e.hidden = !msg; }
+  function fail(box) {
+    return function (e) { showError(e.message); if (box) { box.textContent = ""; } };
+  }
+
+  // ---------- отрисовка шага: ОДНА на просмотр и на редактор ----------
+  // Шаг показывает всё своё содержимое. Единственная разница режимов: если передан opts.onOpen, карточка нажимается
+  // и по нажатию зовёт onOpen(step) — так редактор откроет экран правки. Остальное не меняется.
+  // Содержимое зависит от вида шага: новый вид = новая функция в STEP_BODY, общая рамка не меняется.
+  // Вычисленные поля (step.derived) необязательны: у черновика из редактора их нет, строки тогда просто не рисуются.
+  function metaLine(parts) {
+    var m = el("div", "meta");
+    parts.forEach(function (p, i) {
+      if (i) m.appendChild(document.createTextNode(" · "));
+      m.appendChild(document.createTextNode(p[0]));
+      m.appendChild(el("b", "", p[1]));
+    });
+    return m;
+  }
+  var STEP_BODY = {
+    message: function (step, card) {
+      card.appendChild(el("div", "text", step.text));
+      if (step.request_phone) {
+        var line = el("div", "btnline");
+        line.appendChild(el("span", "kb", "📱 " + step.request_phone.button));
+        line.appendChild(el("span", "kb no", "✖ " + step.request_phone.decline_button));
+        card.appendChild(line);
+        card.appendChild(el("div", "meta", "Просит номер телефона. Воронку это не останавливает: следующие шаги идут по расписанию, пока человек не ответит."));
+      }
+      var on = step.on_reply || {};
+      var branches = Object.keys(on).map(function (o) { return [(OUTCOMES[o] || o) + " → ", on[o]]; });
+      if (branches.length) card.appendChild(metaLine(branches));
+    }
+  };
+  function stepFallback(step, card) {
+    card.appendChild(el("div", "meta", "Вид шага «" + step.kind + "» страница не умеет показывать."));
+  }
+  function renderStep(step, opts) {
+    opts = opts || {};
+    var card = el("div", "card sc" + (opts.onOpen ? " editable" : ""));
+    card.setAttribute("data-step", step.key);
+    var head = el("div", "head");
+    head.appendChild(el("span", "key", step.key));
+    head.appendChild(el("span", "kind", step.kind));
+    head.appendChild(el("span", "delay", fmtDelay(step.delay)));
+    card.appendChild(head);
+    (STEP_BODY[step.kind] || stepFallback)(step, card);
+    var d = step.derived, tail = [];
+    if (step.next) tail.push(["дальше: ", step.next === "end" ? "конец" : step.next]);
+    else if (d) tail.push(["дальше: ", d.next_resolved || "конец"]);
+    if (d && d.reached_by && d.reached_by.length) {
+      tail.push(["сюда ведёт: ", d.reached_by.map(function (r) { return r.step + " (" + (OUTCOMES[r.reply] || r.reply) + ")"; }).join(", ")]);
+    }
+    if (tail.length) card.appendChild(metaLine(tail));
+    if (opts.onOpen) {
+      card.setAttribute("role", "button"); card.tabIndex = 0;
+      card.onclick = function () { opts.onOpen(step); };
+      card.onkeydown = function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); opts.onOpen(step); } };
+    }
+    return card;
+  }
+  window.renderStep = renderStep;
+
+  // ---------- пользователи ----------
+  function loadPhoto(img, holder, id) {
+    api("api/photo/" + id).then(function (r) { return r.ok ? r.blob() : null; }).then(function (b) {
+      if (!b) return;
+      img.src = URL.createObjectURL(b); holder.textContent = ""; holder.appendChild(img);
+    }).catch(function () {});
+  }
+  function userRow(u) {
+    var row = el("div", "u");
+    var ava = el("div", "ava", (u.name || "?").trim().charAt(0).toUpperCase() || "?");
+    row.appendChild(ava);
+    if (u.has_photo) loadPhoto(el("img"), ava, u.tg_id);
+    var info = el("div", "info");
+    info.appendChild(el("div", "nm", u.name || "Без имени"));
+    var sub = el("div", "sub");
+    if (u.username) {
+      var a = el("a", "", "@" + u.username); a.href = "https://t.me/" + u.username;
+      a.target = "_blank"; a.rel = "noopener"; sub.appendChild(a);
+    } else sub.appendChild(document.createTextNode("без username"));
+    info.appendChild(sub);
+    info.appendChild(el("div", "sub", "тел: " + (u.phone || "—")));
+    info.appendChild(el("div", "sub", "пришёл: " + fmt(u.created_at)));
+    row.appendChild(info);
+    return row;
+  }
+  function renderUsers(box, d) {
+    box.textContent = "";
+    if (!d.users.length) { box.appendChild(el("div", "empty", "Пока никого")); return; }
+    d.users.forEach(function (u) { box.appendChild(userRow(u)); });
+    if (d.total > d.users.length)
+      box.appendChild(el("div", "more", "Показано " + d.users.length + " из " + d.total + " (последние по времени прихода)"));
+  }
+  function loadUsers(box, query) {
+    box.textContent = ""; box.appendChild(el("div", "empty", "Загрузка…"));
+    getJson("api/users" + query).then(function (d) { showError(""); renderUsers(box, d); }).catch(fail(box));
+  }
+
+  // ---------- экраны ----------
+  var tab = "funnels";
+  var stack = [];            // экраны поверх главной: {title, render(body), refresh}
+  var current = null;
+
+  function showHome() {
+    $("v-home").hidden = false; $("v-sub").hidden = true; current = null; stack = [];
+    ["funnels", "users"].forEach(function (t) { $("tab-" + t).setAttribute("aria-selected", String(t === tab)); });
+    var box = $("home-body"); box.textContent = ""; showError("");
+    if (tab === "users") {
+      var card = el("div", "card"); box.appendChild(card);
+      loadUsers(card, "");
+    } else {
+      var list = el("div", "flow"); box.appendChild(list);
+      getJson("api/funnels").then(function (d) {
+        showError(""); list.textContent = "";
+        if (!d.funnels.length) list.appendChild(el("div", "card empty", "В конфиге нет воронок"));
+        d.funnels.forEach(function (f) {
+          var b = el("button", "rowlink"); b.type = "button";
+          var l = el("div", "l");
+          var nm = el("div", "nm", f.key);
+          if (f.is_default) { nm.appendChild(document.createTextNode(" ")); nm.appendChild(el("span", "badge", "по умолчанию")); }
+          l.appendChild(nm);
+          l.appendChild(el("div", "sub", f.steps.length + " шаг(ов) · запустили: " + f.levels[0].count));
+          b.appendChild(l); b.appendChild(el("div", "chev", "›"));
+          b.onclick = function () { push(funnelScreen(f)); };
+          list.appendChild(b);
+        });
+      }).catch(fail(list));
+    }
+  }
+  function push(screen) {
+    stack.push(screen); show();
+  }
+  function show() {
+    var scr = stack[stack.length - 1];
+    if (!scr) return showHome();
+    $("v-home").hidden = true; $("v-sub").hidden = false; current = scr;
+    $("sub-title").textContent = scr.title;
+    var body = $("sub-body"); body.textContent = ""; showError("");
+    scr.render(body);
+    window.scrollTo(0, 0);
+  }
+  function back() { stack.pop(); show(); }
+
+  // воронка: сниппет + «Подробнее», ниже структура + «Редактировать»
+  function funnelScreen(f) {
+    return { title: "Воронка: " + f.key, render: function (body) {
+      var snip = el("div", "card");
+      var grid = el("div", "snip");
+      f.levels.forEach(function (l) {
+        var c = el("div"); c.appendChild(el("div", "n", String(l.count))); c.appendChild(el("div", "t", l.title));
+        grid.appendChild(c);
+      });
+      snip.appendChild(grid);
+      var foot = el("div", "snipfoot"), r = f.runs || {};
+      foot.appendChild(el("div", "note", "Прогонов: идут " + (r.active || 0) + ", завершены " + (r.completed || 0) +
+        ", отменены " + (r.cancelled || 0)));
+      var more = el("button", "btn primary", "Подробнее"); more.type = "button";
+      more.onclick = function () { push(statsScreen(f)); };
+      foot.appendChild(more); snip.appendChild(foot);
+      body.appendChild(snip);
+
+      body.appendChild(el("h2", "", "Структура воронки"));
+      var flow = el("div", "flow");
+      f.steps.forEach(function (st) { flow.appendChild(renderStep(st)); });   // просмотр: шаги не нажимаются
+      body.appendChild(flow);
+      body.appendChild(el("div", "gap"));
+      var edit = el("button", "btn", "Редактировать"); edit.type = "button";
+      edit.onclick = function () { push(editScreen(f)); };
+      body.appendChild(edit);
+    } };
+  }
+  // заглушка: конструктор появится в следующей части
+  function editScreen(f) {
+    return { title: "Редактирование: " + f.key, render: function (body) {
+      body.appendChild(el("div", "card empty", "Редактор воронок появится в следующей версии."));
+    } };
+  }
+
+  // страница воронки: три уровня, шаги по статусам, события
+  function statsScreen(f) {
+    var scr = { title: "Статистика: " + f.key, live: true };
+    scr.render = function (body) {
+      var q = encodeURIComponent(f.key);
+      var levelsBox = el("div", "levels"), runs = el("div", "note"), steps = el("div"), ev = el("div", "card");
+      body.appendChild(levelsBox); body.appendChild(runs);
+      body.appendChild(el("h2", "", "Шаги воронки")); body.appendChild(steps);
+      body.appendChild(el("h2", "", "Последние события")); body.appendChild(ev);
+      getJson("api/overview?funnel=" + q).then(function (d) {
+        showError(""); renderOverview(d, f, levelsBox, runs, steps, ev);
+      }).catch(fail());
+    };
+    return scr;
+  }
+  function renderOverview(d, f, box, runsBox, st, ev) {
+    box.textContent = "";
+    var max = Math.max.apply(null, d.levels.map(function (l) { return l.count; }).concat([1]));
+    d.levels.forEach(function (l, i) {
+      var b = el("button", "level"); b.type = "button";
+      var left = el("div", "l");
+      left.appendChild(el("div", "t", (i + 1) + ". " + l.title));
+      var bar = el("div", "bar"); bar.style.width = Math.round(l.count / max * 100) + "%";
+      left.appendChild(bar);
+      b.appendChild(left); b.appendChild(el("div", "n", String(l.count))); b.appendChild(el("div", "chev", "›"));
+      b.onclick = function () { push(levelScreen(f, l)); };
+      box.appendChild(b);
+    });
+    var r = d.runs || {};
+    runsBox.textContent = "Прогонов: идут " + (r.active || 0) + ", завершены " + (r.completed || 0) +
+      ", отменены " + (r.cancelled || 0);
+
+    st.textContent = "";
+    if (!d.steps.length) st.appendChild(el("div", "card empty", "Шагов нет"));
+    d.steps.forEach(function (s) {
+      var c = el("div", "card step");
+      c.appendChild(el("div", "name", s.step));
+      var chips = el("div", "chips");
+      STAT.forEach(function (p) {
+        var v = s[p[0]];
+        if (!v && p[0] !== "sent" && p[0] !== "cancelled" && p[0] !== "expired" && p[0] !== "error") return;
+        var ch = el("span", "chip " + p[0]); ch.appendChild(el("b", "", String(v)));
+        ch.appendChild(document.createTextNode(" " + p[1])); chips.appendChild(ch);
+      });
+      c.appendChild(chips);
+      if (s.sent_in_cancelled) c.appendChild(el("div", "note",
+        "из отправленных " + s.sent_in_cancelled + " ушло внутри уже отменённого прогона (отправка была начата до отмены)"));
+      st.appendChild(c);
+    });
+
+    ev.textContent = "";
+    if (!d.events.length) ev.appendChild(el("div", "empty", "Событий пока нет"));
+    d.events.forEach(function (e) {
+      var k = KINDS[e.kind] || [e.kind, ""];
+      var row = el("div", "ev");
+      row.appendChild(el("div", "time", fmt(e.ts)));
+      var body = el("div", "body");
+      body.appendChild(el("div", "kind " + k[1], k[0]));
+      var who = e.name || (e.user_id ? "id " + e.user_id : "");
+      if (e.username) who += " @" + e.username;
+      if (who) body.appendChild(el("div", "who", who));
+      if (e.details) body.appendChild(el("div", "det", e.details));
+      row.appendChild(body); ev.appendChild(row);
+    });
+  }
+  function levelScreen(f, level) {
+    return { title: level.title + " — " + level.count, render: function (body) {
+      var card = el("div", "card"); body.appendChild(card);
+      loadUsers(card, "?level=" + encodeURIComponent(level.key) + "&funnel=" + encodeURIComponent(f.key));
+    } };
+  }
+
+  // авто-обновление только на странице статистики; главная обновляется кнопкой
+  function rerender() { var b = $("sub-body"), y = window.scrollY; b.textContent = ""; current.render(b); window.scrollTo(0, y); }
+
+  $("back").onclick = back;
+  $("refresh").onclick = showHome;
+  ["funnels", "users"].forEach(function (t) { $("tab-" + t).onclick = function () { tab = t; showHome(); }; });
+  showHome();
+  setInterval(function () { if (current && current.live) rerender(); }, 15000);
+})();
+</script>
+</body>
+</html>
