@@ -31,6 +31,18 @@ def get(path, init=None):
         return e.code, e.read().decode()
 
 
+def post(path, body, init=None):
+    headers = {"Content-Type": "application/json"}
+    if init:
+        headers["X-Init-Data"] = init
+    req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
 class TestDashboardHttp(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -102,6 +114,33 @@ class TestDashboardHttp(unittest.TestCase):
         self.assertEqual([l["count"] for l in f[2]["levels"]], [1, 0, 0])      # воронка без запроса номера
         self.assertEqual(get("/api/overview?funnel=nope", init)[0], 404)
         self.assertEqual(get("/api/users?level=started&funnel=nope", init)[0], 400)
+
+    def promo_steps(self, init):
+        f = json.loads(get("/api/funnels", init)[1])
+        return [x for x in f["funnels"] if x["key"] == "promo"][0]["steps"], f["can_edit"]
+
+    def test_write_rights_over_http(self):
+        now = int(time.time())
+        viewer, admin = make_init_data(TOKEN, 7, now), make_init_data(TOKEN, 42, now)
+        steps, can = self.promo_steps(viewer)
+        self.assertFalse(can)                                   # странице сказано: кнопку не показывать
+        self.assertTrue(self.promo_steps(admin)[1])
+        draft = [{"key": s["key"], "kind": s["kind"], "text": "взлом"} for s in steps]
+        for init, label in ((None, "без подписи"), ("hash=x&auth_date=1", "поддельная подпись"), (viewer, "не админ")):
+            code, _ = post("/api/funnels/promo", {"steps": draft}, init)
+            self.assertEqual(code, 403, label)
+            self.assertEqual(self.promo_steps(admin)[0][0]["text"], "акция", label + ": файл тронут")
+        # админ: неверный черновик — 400 с причиной, файл как был
+        bad = [dict(draft[0], text="")]
+        code, body = post("/api/funnels/promo", {"steps": bad}, admin)
+        self.assertEqual(code, 400)
+        self.assertIn("text", json.loads(body)["error"])
+        self.assertEqual(self.promo_steps(admin)[0][0]["text"], "акция")
+        # админ: верный черновик — записано и сразу видно в API
+        code, body = post("/api/funnels/promo", {"steps": [dict(draft[0], text="акция 2")]}, admin)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.promo_steps(viewer)[0][0]["text"], "акция 2")
+        self.assertEqual(post("/api/funnels/nope", {"steps": draft}, admin)[0], 404)
 
 
 if __name__ == "__main__":

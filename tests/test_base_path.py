@@ -24,6 +24,11 @@ from urllib.parse import urljoin, urlsplit
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 sys.path.insert(0, ROOT)
+
+
+def read(path, mode="r"):
+    with open(path, mode, **({} if "b" in mode else {"encoding": "utf-8"})) as f:
+        return f.read()
 from test_core import make_init_data  # noqa: E402
 from app.settings import _dir_url  # noqa: E402
 
@@ -31,7 +36,7 @@ TOKEN = "123456:TEST-TOKEN"
 APP_PORT, FRONT_PORT = 18097, 18098
 PREFIX = "/tg-demo"
 INDEX = os.path.join(ROOT, "app", "static", "index.html")
-HTML = open(INDEX, encoding="utf-8").read()
+HTML = read(INDEX)
 
 
 def fetch(url, init=None):
@@ -104,11 +109,11 @@ class TestBasePath(unittest.TestCase):
 
     def test_page_calls_all_three_endpoints_relative(self):
         lits = api_literals(HTML)
-        self.assertEqual(sorted(lits), ["api/funnels", "api/overview?funnel=", "api/photo/", "api/users"])
+        self.assertEqual(sorted(lits), ["api/funnels", "api/funnels/", "api/overview?funnel=", "api/photo/", "api/users"])
         self.assertFalse([p for p in lits if p.startswith("/")])
 
     def test_resolved_paths_stay_under_page_directory(self):
-        names = ["api/funnels", "api/overview", "api/photo/", "api/users"]
+        names = ["api/funnels", "api/funnels/", "api/overview", "api/photo/", "api/users"]
         self.assertEqual(sorted(urlsplit(u).path for u in self.resolve("https://h.example/")),
                          ["/" + n for n in names])
         self.assertEqual(sorted(urlsplit(u).path for u in self.resolve("https://h.example/tg-demo/")),
@@ -125,7 +130,7 @@ class TestBasePath(unittest.TestCase):
         # страница собирает адреса из этих кусков: добавляем то, что она подставляет при ходе по экранам
         urls = ["api/funnels", "api/overview?funnel=signup", "api/users", "api/users?level=phone&funnel=signup"]
         self.assertTrue(all(any(lit.split("?")[0] == u.split("?")[0] for u in urls)
-                            for lit in api_literals(body) if not lit.endswith("photo/")))
+                            for lit in api_literals(body) if not lit.endswith(("photo/", "funnels/"))))
         for lit in urls:  # фото в preview_server нет; путь проверен в test_resolved_paths…
             url = urljoin(page_url, lit)
             self.assertTrue(url.startswith(base), url)

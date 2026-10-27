@@ -15,6 +15,11 @@ from urllib.parse import urlencode
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+
+def read(path, mode="r"):
+    with open(path, mode, **({} if "b" in mode else {"encoding": "utf-8"})) as f:
+        return f.read()
+
 from app import stats  # noqa: E402
 from app.auth import authorize, verify_init_data, AuthError  # noqa: E402
 from app.config import ConfigError, parse_config  # noqa: E402
@@ -25,19 +30,23 @@ from app.service import FunnelService, UserInfo, has_tag  # noqa: E402
 from app.worker import Worker  # noqa: E402
 
 def _funnel_raw():
-    """Воронка из задания в новой модели: приветствие -> запрос номера -> напоминания (10 с, 1 мин);
-    ответ уводит на «спасибо»/«отказ». Тексты те же, что у старых тестов, где это возможно."""
+    """Поставляемая воронка в блоках: условие «номер оставлен» -> (да) «заявка у менеджера» / (нет) приветствие ->
+    запрос номера -> пауза 10 с -> напоминание -> пауза 1 мин -> напоминание; ответ уводит на «спасибо»/«отказ»."""
     return {
-        "entry_conditions": [{"kind": "phone_given", "reply": "ЗАЯВКА У МЕНЕДЖЕРА"}],
         "steps": [
+            {"key": "has_phone", "kind": "condition", "check": {"kind": "phone_given"},
+             "on_true": "already", "on_false": "next"},
             {"key": "welcome", "kind": "message", "text": "привет"},
             {"key": "ask", "kind": "message", "text": "телефон?",
              "request_phone": {"button": "дать", "decline_button": "нет"},
              "on_reply": {"contact": "thanks", "decline": "declined"}},
-            {"key": "m1", "kind": "message", "delay": "10s", "text": "первое"},
-            {"key": "m2", "kind": "message", "delay": "1m", "text": "второе"},
-            {"key": "thanks", "kind": "message", "text": "спасибо"},
-            {"key": "declined", "kind": "message", "text": "ладно"},
+            {"key": "d1", "kind": "delay", "duration": "10s"},
+            {"key": "m1", "kind": "message", "text": "первое"},
+            {"key": "d2", "kind": "delay", "duration": "1m"},
+            {"key": "m2", "kind": "message", "text": "второе", "next": "end"},
+            {"key": "already", "kind": "message", "text": "ЗАЯВКА У МЕНЕДЖЕРА", "next": "end"},
+            {"key": "thanks", "kind": "message", "text": "спасибо", "next": "end"},
+            {"key": "declined", "kind": "message", "text": "ладно", "next": "end"},
         ],
     }
 
@@ -47,10 +56,11 @@ RAW = {
                  "retry_delay": "5s"},
     "funnels": {
         "signup": _funnel_raw(),
-        "promo": {"steps": [{"key": "only", "kind": "message", "delay": 0, "text": "акция"}]},
+        "promo": {"steps": [{"key": "only", "kind": "message", "text": "акция"}]},
         # воронка вообще без запроса номера
         "plain": {"steps": [{"key": "a", "kind": "message", "text": "A"},
-                            {"key": "b", "kind": "message", "delay": "5s", "text": "B"}]},
+                            {"key": "wb", "kind": "delay", "duration": "5s"},
+                            {"key": "b", "kind": "message", "text": "B"}]},
         # два запроса номера подряд: второй идёт после «спасибо» первого
         "double": {"steps": [
             {"key": "ask1", "kind": "message", "text": "номер1?", "request_phone": {"button": "дать", "decline_button": "нет"},
@@ -146,8 +156,8 @@ class TestStartCases(Base):
         self.assertTrue(self.sender.sent[1][2]["phone_button"])
         self.assertNotIn("phone_button", self.sender.sent[0][2])
         self.assertEqual(len(self.q("SELECT * FROM runs WHERE status='active'")), 1)
-        # запланирован только следующий шаг
-        self.assertEqual([r["step_key"] for r in self.q("SELECT step_key FROM queue WHERE status='pending'")], ["m1"])
+        # запланирован только следующий шаг: пауза перед напоминанием
+        self.assertEqual([r["step_key"] for r in self.q("SELECT step_key FROM queue WHERE status='pending'")], ["d1"])
 
     async def test_restart_while_running_cancels_old_run_and_pending(self):
         await self.begin()
@@ -170,7 +180,10 @@ class TestStartCases(Base):
         self.assertEqual(self.sender.texts()[n:], ["привет", "телефон?"])
         self.assert_one_open()
 
-    async def test_restart_after_phone_left_is_blocked_by_entry_condition(self):
+    async def test_restart_after_phone_left_goes_through_condition_to_manager_message(self):
+        """Условие «номер оставлен» — первый шаг воронки. В чате всё как раньше: одно сообщение и конец.
+        Единственное отличие от прежней модели: условие теперь шаг прогона, а сообщению нужен run_id,
+        поэтому на такой /start создаётся короткий прогон, который сразу завершается."""
         await self.begin()
         await self.svc.contact(111, "+37400000000", 111)
         await self.drain()
@@ -179,19 +192,26 @@ class TestStartCases(Base):
         self.assertEqual(self.q("SELECT status FROM runs")[0]["status"], "completed")
         n_sent = len(self.sender.sent)
         r = await self.svc.start(self.u)
-        self.assertEqual(r, "blocked")
-        self.assertEqual(self.sender.sent[n_sent:][0][1], "ЗАЯВКА У МЕНЕДЖЕРА")
-        self.assertEqual(len(self.sender.sent), n_sent + 1)
-        self.assertEqual(len(self.q("SELECT * FROM runs")), 1)
+        self.assertEqual(r, "new")
+        await self.drain()
+        self.assertEqual(self.sender.texts()[n_sent:], ["ЗАЯВКА У МЕНЕДЖЕРА"])      # ровно одно сообщение
+        self.assertEqual([r["status"] for r in self.q("SELECT status FROM runs ORDER BY id")], ["completed", "completed"])
+        self.assertEqual(self.q("SELECT * FROM queue WHERE status IN ('pending','processing')"), [])
         await self.drain(advance=100)
-        self.assertEqual(len(self.sender.sent), n_sent + 1)    # и в очередь ничего не попало
+        self.assertEqual(len(self.sender.sent), n_sent + 1)    # и больше ничего не пришло
+        ev = self.q("SELECT details FROM events WHERE kind='condition' ORDER BY id DESC")[0]["details"]
+        self.assertEqual(ev, "has_phone: да → already")
 
-    async def test_phone_left_blocks_even_while_thanks_run_is_active(self):
-        """Контакт пришёл, прогон ещё идёт (спасибо не ушло): /start уже не начинает заново."""
+    async def test_start_while_thanks_run_is_active_goes_through_condition_too(self):
+        """Контакт пришёл, прогон ещё идёт (спасибо не ушло): повторный /start — обычный перезапуск; условие
+        видит номер и отвечает «заявка у менеджера». (Раньше /start тут блокировался до отмены прогона.)"""
         await self.begin()
         await self.svc.contact(111, "+37400000000", 111)
-        self.assertEqual(await self.svc.start(self.u), "blocked")
-        self.assertEqual(len(self.q("SELECT * FROM runs")), 1)
+        self.assertEqual(await self.svc.start(self.u), "restarted")
+        await self.drain()
+        self.assertEqual(self.sender.texts()[-1], "ЗАЯВКА У МЕНЕДЖЕРА")
+        self.assertNotIn("спасибо", self.sender.texts())
+        self.assertEqual(self.q("SELECT * FROM queue WHERE status IN ('pending','processing')"), [])
 
     async def test_restart_after_reminders_ran_out_without_answer_starts_over(self):
         await self.begin()
@@ -271,6 +291,7 @@ class TestQueue(Base):
         await self.begin()
         old = self.q("SELECT id FROM runs")[0]["id"]
         self.clock.t += 11
+        await self.worker.tick()                              # пауза d1 отработала (ничего не шлёт)
         self.sender.gate = asyncio.Event()
         task = asyncio.create_task(self.worker.tick())
         await self.sender.entered.wait()           # шаг взят в работу и висит в отправке
@@ -284,7 +305,7 @@ class TestQueue(Base):
         self.assertEqual((row["qs"], row["rs"]), ("sent", "cancelled"))
         # у отменённого прогона ничего не запланировано дальше
         self.assertEqual([x["step_key"] for x in self.q("SELECT step_key FROM queue WHERE run_id=? ORDER BY id", old)],
-                         ["welcome", "ask", "m1"])
+                         ["welcome", "ask", "d1", "m1"])
         st = [s for s in stats.steps(self.db.conn, self.cfg) if s["step"] == "m1"][0]
         self.assertEqual((st["sent"], st["sent_in_cancelled"]), (1, 1))
         # отменённый прогон не стал «завершённым» и метка done не поставлена
@@ -310,6 +331,7 @@ class TestQueue(Base):
     async def test_retry_after_waits_exactly_that_long(self):
         await self.begin()
         self.clock.t += 11
+        await self.worker.tick()                              # пауза d1 отработала
         self.sender.errors = [RetryAfter(7)]
         self.sleeps.clear()
         await self.worker.tick()
@@ -340,7 +362,8 @@ class TestQueue(Base):
     async def test_recover_marks_processing_as_error_without_resend(self):
         await self.begin()
         self.clock.t += 11
-        self.worker.claim()
+        await self.worker.tick()                              # пауза d1 отработала
+        self.worker.claim()                                   # m1 взято в работу
         self.assertEqual(self.worker.recover(), 1)
         n = len(self.sender.sent)
         await self.drain(advance=1)
@@ -378,7 +401,7 @@ class TestPhone(Base):
         self.assertEqual(await self.svc.contact(111, "+1", 999), "foreign")
         self.assertIsNone(self.q("SELECT phone FROM users")[0]["phone"])
         self.assertEqual(self.sender.sent[-1][1], "телефон?")     # просим ещё раз
-        self.assertEqual([r["step_key"] for r in self.q("SELECT step_key FROM queue WHERE status='pending'")], ["m1"])
+        self.assertEqual([r["step_key"] for r in self.q("SELECT step_key FROM queue WHERE status='pending'")], ["d1"])
 
     async def test_reply_without_request_is_ignored(self):
         await self.svc.start(self.u)                   # приветствие ещё не ушло, запрос тем более
@@ -405,11 +428,11 @@ class TestFunnelModel(Base):
 
     async def test_contact_between_reminders_cancels_pending_and_sends_thanks_once(self):
         await self.begin()
-        await self.drain(advance=11)                          # m1 ушёл, m2 ждёт
-        self.assertEqual([r["step_key"] for r in self.q("SELECT step_key FROM queue WHERE status='pending'")], ["m2"])
+        await self.drain(advance=11)                          # m1 ушёл, пауза перед m2 ждёт
+        self.assertEqual([r["step_key"] for r in self.q("SELECT step_key FROM queue WHERE status='pending'")], ["d2"])
         self.assertEqual(await self.svc.contact(111, "+37400000000", 111), "accepted")
         self.assert_one_open()
-        self.assertEqual(self.q("SELECT status FROM queue WHERE step_key='m2'")[0]["status"], "cancelled")
+        self.assertEqual(self.q("SELECT status FROM queue WHERE step_key='d2'")[0]["status"], "cancelled")
         await self.drain()
         await self.drain(advance=1000)
         self.assertEqual(self.sender.texts(), ["привет", "телефон?", "первое", "спасибо"])
@@ -433,6 +456,7 @@ class TestFunnelModel(Base):
     async def test_reply_during_reminder_in_flight_is_deferred_not_doubled(self):
         await self.begin()
         self.clock.t += 11
+        await self.worker.tick()                              # пауза d1 отработала (ничего не шлёт)
         self.sender.gate = asyncio.Event()
         task = asyncio.create_task(self.worker.tick())
         await self.sender.entered.wait()                      # m1 в отправке
@@ -450,6 +474,7 @@ class TestFunnelModel(Base):
     async def test_reply_while_reminder_fails_transiently_replaces_it(self):
         await self.begin()
         self.clock.t += 11
+        await self.worker.tick()                              # пауза d1 отработала (ничего не шлёт)
         self.sender.gate = asyncio.Event()
         self.sender.errors = [Transient("сеть")]
         task = asyncio.create_task(self.worker.tick())
@@ -501,7 +526,7 @@ class TestFunnelModel(Base):
         await self.svc.start(self.u)
         runs = self.q("SELECT status FROM runs ORDER BY id")
         self.assertEqual([r["status"] for r in runs], ["cancelled", "active"])
-        self.assertEqual(self.q("SELECT status FROM queue WHERE step_key='m2'")[0]["status"], "cancelled")
+        self.assertEqual(self.q("SELECT status FROM queue WHERE step_key='d2'")[0]["status"], "cancelled")
         n = len(self.sender.sent)
         await self.drain()
         self.assertEqual(self.sender.texts()[n:], ["привет", "телефон?"])
@@ -555,14 +580,21 @@ class TestConfig(unittest.TestCase):
             parse_config(bad)
 
     def test_links_between_steps_are_validated(self):
-        self._broken(lambda f: f["steps"][1]["on_reply"].update(contact="нет-такого"), "шага 'нет-такого' нет")
-        self._broken(lambda f: f["steps"][2].update(next="нет-такого"), "next")
-        self._broken(lambda f: f["steps"][1]["on_reply"].pop("decline"), "не указан шаг для ответа 'decline'")
-        self._broken(lambda f: f["steps"][1]["on_reply"].update(maybe="m1"), "неизвестный ответ")
-        self._broken(lambda f: f["steps"][2].update(on_reply={"contact": "thanks", "decline": "declined"}),
+        self._broken(lambda f: f["steps"][2]["on_reply"].update(contact="нет-такого"), "шага 'нет-такого' нет")
+        self._broken(lambda f: f["steps"][4].update(next="нет-такого"), "next")
+        self._broken(lambda f: f["steps"][2]["on_reply"].pop("decline"), "не указан шаг для ответа 'decline'")
+        self._broken(lambda f: f["steps"][2]["on_reply"].update(maybe="m1"), "неизвестный ответ")
+        self._broken(lambda f: f["steps"][1].update(on_reply={"contact": "thanks", "decline": "declined"}),
                      "request_phone нет")
-        self._broken(lambda f: f["steps"][0].update(key="end"), "служебное слово")
-        self._broken(lambda f: (f["steps"][2].update(next="m2"), f["steps"][3].update(next="m1")), "зацикливается")
+        self._broken(lambda f: f["steps"][1].update(key="end"), "служебное слово")
+        self._broken(lambda f: f["steps"][1].update(key="next"), "служебное слово")
+        self._broken(lambda f: f["steps"][0].update(on_true="нет-такого"), "on_true: шага 'нет-такого' нет")
+        self._broken(lambda f: f["steps"][0].pop("on_false"), "оба выхода")
+        self._broken(lambda f: f["steps"][3].pop("duration"), "нет поля 'duration'")
+        self._broken(lambda f: f["steps"][1].update(delay="10s"), "задержки больше нет")
+        self._broken(lambda f: f.update(entry_conditions=[]), "раздел убран")
+        self._broken(lambda f: f["steps"][0].update(check={"kind": "weather"}), "неизвестная проверка")
+        self._broken(lambda f: f["steps"][0].update(check={"kind": "tag"}), "tag")
 
     def test_removed_welcome_and_phone_fields_are_rejected_loudly(self):
         self._broken(lambda f: f.update(welcome="привет"), "welcome: поле убрано")
@@ -570,16 +602,19 @@ class TestConfig(unittest.TestCase):
 
     def test_chain_order_and_branch_targets(self):
         f = parse_config(RAW).funnel("signup")
-        order, cur = [], f.first
+        # «спасибо», «ладно» и «заявка у менеджера» по списку не достижимы; условие идёт через exit_step
+        self.assertEqual(f.exit_step(f.first, False).key, "welcome")
+        self.assertEqual(f.exit_step(f.first, True).key, "already")
+        order, cur = [], f.step("welcome")
         while cur:
             order.append(cur.key)
             cur = f.next_step(cur)
-        self.assertEqual(order, ["welcome", "ask", "m1", "m2"])    # «спасибо» и «ладно» по списку не достижимы
-        self.assertEqual(f.branch_targets(), {"thanks", "declined"})
+        self.assertEqual(order, ["welcome", "ask", "d1", "m1", "d2", "m2"])
+        self.assertEqual(f.branch_targets(), {"thanks", "declined", "already"})
 
     def test_defaults_from_task(self):
         c = parse_config(RAW).funnel("signup")
-        self.assertEqual([(s.key, s.delay) for s in c.steps if s.key in ("m1", "m2")], [("m1", 10.0), ("m2", 60.0)])
+        self.assertEqual([(s.key, s.duration) for s in c.steps if s.kind == "delay"], [("d1", 10.0), ("d2", 60.0)])
 
     def test_real_yaml_file_if_pyyaml_present(self):
         try:
@@ -587,9 +622,9 @@ class TestConfig(unittest.TestCase):
         except ImportError:
             self.skipTest("PyYAML не установлен в этом окружении")
         from app.config import load_config
-        cfg = load_config(os.path.join(ROOT, "funnels.yml"))
+        cfg = load_config(os.path.join(ROOT, "config/funnels.yml"))
         steps = {s.key: s for s in cfg.funnel("signup").steps}
-        self.assertEqual((steps["reminder_1"].delay, steps["reminder_2"].delay), (10.0, 60.0))
+        self.assertEqual((steps["wait_1"].duration, steps["wait_2"].duration), (10.0, 60.0))
         self.assertEqual(dict(steps["ask_phone"].on_reply), {"contact": "thanks", "decline": "declined"})
 
 
@@ -615,6 +650,7 @@ class TestLock(unittest.TestCase):
         finally:
             holder.kill()
             holder.wait()
+            holder.stdout.close()
 
     def test_in_process_second_acquire_fails(self):
         p = os.path.join(tempfile.mkdtemp(), "l")
@@ -715,7 +751,7 @@ class TestPhoneMasking(unittest.TestCase):
         self.assertEqual(rows[3], "37455123456")
 
     def test_static_page_never_contains_a_number(self):
-        body = open(os.path.join(ROOT, "app", "static", "index.html"), encoding="utf-8").read()
+        body = read(os.path.join(ROOT, "app", "static", "index.html"))
         for ph in self.PHONES.values():
             self.assertNotIn(ph, body)
 
@@ -764,7 +800,7 @@ class TestSecretsAndDb(unittest.TestCase):
     def test_no_token_in_static_pages_or_api_payloads(self):
         static = os.path.join(ROOT, "app", "static")
         for name in os.listdir(static):
-            body = open(os.path.join(static, name), encoding="utf-8").read()
+            body = read(os.path.join(static, name))
             self.assertNotIn(TOKEN, body)
             import re
             self.assertIsNone(re.search(r"\d{6,}:[A-Za-z0-9_-]{20,}", body), name)

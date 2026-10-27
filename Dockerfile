@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY funnels.yml .
+COPY config ./config
 
 # база, замок и кеш фото лежат в /app/data — подключите том
 CMD ["python", "-m", "app"]

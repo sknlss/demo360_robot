@@ -41,7 +41,7 @@ class EnvSettings:
         return cls(
             bot_token=env("BOT_TOKEN", ""),
             db_path=db_path,
-            config_path=env("CONFIG_PATH", "funnels.yml"),
+            config_path=env("CONFIG_PATH", "config/funnels.yml"),
             web_host=env("WEB_HOST", "127.0.0.1"),
             web_port=int(env("WEB_PORT", "8080")),
             admin_ids=frozenset(int(x) for x in ids),

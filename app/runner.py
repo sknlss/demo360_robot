@@ -8,7 +8,8 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiohttp import web
 
 from .bot import AiogramSender, build_router
-from .config import ConfigError, load_config
+from .config import ConfigError
+from .configstore import ConfigStore
 from .db import Database
 from .photos import PhotoCache
 from .service import FunnelService
@@ -20,7 +21,7 @@ log = logging.getLogger("funnel")
 
 async def amain(settings) -> int:
     try:
-        cfg = load_config(settings.config_path)
+        cfg = ConfigStore(settings.config_path)  # перечитывается при изменении файла
     except ConfigError as e:
         log.error("конфиг воронок: %s", e)
         return 2

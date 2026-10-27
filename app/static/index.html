@@ -89,6 +89,7 @@
   .sc .head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .sc .key { font-weight: 700; word-break: break-all; }
   .sc .kind { font-size: 12px; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0 8px; }
+  .card.trigger { border-style: dashed; padding: 12px 14px; }
   .sc .delay { margin-left: auto; font-size: 13px; color: var(--muted); white-space: nowrap; }
   .sc .text { margin: 8px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
   .sc .meta { margin-top: 8px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
@@ -98,6 +99,26 @@
   .sc .kb.no { opacity: .75; }
   .more { padding: 12px; text-align: center; color: var(--muted); font-size: 13px; }
   .gap { height: 10px; }
+  .field { margin: 0 0 14px; }
+  .field > label, .field > .lbl { display: block; font-size: 13px; color: var(--muted); margin: 0 0 4px; }
+  .field input[type=text], .field textarea, .field select {
+    width: 100%; font: inherit; color: var(--text); background: var(--card); padding: 10px 12px;
+    border: 1px solid var(--line); border-radius: 10px; }
+  .field textarea { min-height: 110px; resize: vertical; }
+  .field input:read-only { color: var(--muted); background: var(--bg); }
+  .field .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .switch { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line);
+            border-radius: 10px; background: var(--card); cursor: pointer; }
+  .switch input { width: 20px; height: 20px; margin: 0; }
+  .sub-fields { margin: 10px 0 0 10px; padding-left: 12px; border-left: 3px solid var(--line); }
+  .tools { display: flex; gap: 6px; margin: 6px 0 0; }
+  .tools .btn { width: auto; flex: 1; padding: 7px 8px; font-size: 14px; }
+  .tools .btn[disabled] { opacity: .35; pointer-events: none; }
+  .tools .btn.danger { color: var(--bad); border-color: var(--bad); }
+  .msg { padding: 10px 14px; border-radius: 10px; margin: 0 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.bad { background: color-mix(in srgb, var(--bad) 14%, var(--card)); color: var(--bad); border: 1px solid var(--bad); }
+  .msg.good { background: color-mix(in srgb, var(--ok) 14%, var(--card)); color: var(--ok); border: 1px solid var(--ok); }
+  .savebar { position: sticky; bottom: 0; padding: 10px 0 4px; background: linear-gradient(transparent, var(--bg) 30%); }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -133,11 +154,20 @@
     phone_declined: ["Отказался от телефона", "warn"], message_sent: ["Получил сообщение", "ok"],
     send_failed: ["Ошибка отправки", "bad"], run_cancelled: ["Прогон отменён", "warn"],
     run_completed: ["Прогон завершён", "ok"], step_expired: ["Шаг просрочен", "warn"],
-    start_blocked: ["Повторный старт: номер уже оставлен", ""]
+    condition: ["Проверено условие", ""]
   };
+  var KIND_RU = { message: "Сообщение", delay: "Задержка", condition: "Условие" };
+  var CHECK_RU = { phone_given: "номер оставлен" };
   var STAT = [["sent", "отправлено"], ["cancelled", "отменено"], ["expired", "просрочено"],
               ["error", "ошибок"], ["pending", "ждут"], ["processing", "в работе"]];
-  var OUTCOMES = { contact: "прислал номер", decline: "отказ" };
+  var OUTCOMES = { contact: "прислал номер", decline: "отказ", on_true: "условие: да", on_false: "условие: нет" };
+  function checkText(c) { return c.kind === "tag" ? "есть метка «" + (c.tag || "") + "»" : (CHECK_RU[c.kind] || c.kind); }
+  // выход условия: next — следующий по списку, end — конец прогона, иначе ключ шага
+  function exitText(v, resolved) {
+    if (v === "end") return "закончить прогон";
+    if (v === "next") return "следующий по списку" + (resolved ? ": " + resolved : (resolved === null ? ": конец" : ""));
+    return v;
+  }
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -146,14 +176,23 @@
     return e;
   }
   // Пути БЕЗ ведущей «/»: страница может лежать не в корне домена (например /tg-demo/), адрес считается от неё
-  function api(path) {
-    return fetch(path, { headers: { "X-Init-Data": initData } });
+  function api(path, opts) {
+    opts = opts || {};
+    var headers = { "X-Init-Data": initData };
+    if (opts.body !== undefined) headers["Content-Type"] = "application/json";
+    return fetch(path, { method: opts.method || "GET", headers: headers, body: opts.body });
   }
   function getJson(path) {
     return api(path).then(function (r) {
       if (!r.ok) throw new Error(r.status === 403
         ? "Доступ закрыт: дашборд открывается только из Telegram (нужна подпись Telegram)." : "Ошибка " + r.status);
       return r.json();
+    });
+  }
+  // запись: ответ сервера (в том числе текст отказа проверки) отдаём как есть, права проверяет сервер
+  function postJson(path, data) {
+    return api(path, { method: "POST", body: JSON.stringify(data) }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { status: r.status, body: j }; });
     });
   }
   function fmt(ts) {
@@ -204,6 +243,25 @@
       if (branches.length) card.appendChild(metaLine(branches));
     }
   };
+  STEP_BODY.delay = function (step, card) {
+    card.appendChild(el("div", "text", "Пауза " + (step.duration_text || fmtDelay(step.duration)) + ", потом следующий шаг."));
+  };
+  STEP_BODY.condition = function (step, card) {
+    card.appendChild(el("div", "text", "Проверка: " + checkText(step.check || {})));
+    var ex = step.derived && step.derived.exits;
+    card.appendChild(metaLine([["да → ", exitText(step.on_true, ex && ex.on_true)]]));
+    card.appendChild(metaLine([["нет → ", exitText(step.on_false, ex && ex.on_false)]]));
+  };
+  // неизменяемый блок в начале ленты: с чего начинается воронка. Не шаг: в конфиг и в черновик не попадает
+  function renderTrigger() {
+    var card = el("div", "card trigger");
+    var head = el("div", "head");
+    head.appendChild(el("span", "key", "Триггер: /start"));
+    head.style.fontWeight = "600";
+    card.appendChild(head);
+    card.appendChild(el("div", "meta", "Воронка начинается, когда человек пишет боту /start (ссылка t.me/бот?start=ключ_воронки). Не редактируется."));
+    return card;
+  }
   function stepFallback(step, card) {
     card.appendChild(el("div", "meta", "Вид шага «" + step.kind + "» страница не умеет показывать."));
   }
@@ -213,12 +271,12 @@
     card.setAttribute("data-step", step.key);
     var head = el("div", "head");
     head.appendChild(el("span", "key", step.key));
-    head.appendChild(el("span", "kind", step.kind));
-    head.appendChild(el("span", "delay", fmtDelay(step.delay)));
+    head.appendChild(el("span", "kind", KIND_RU[step.kind] || step.kind));
     card.appendChild(head);
     (STEP_BODY[step.kind] || stepFallback)(step, card);
     var d = step.derived, tail = [];
-    if (step.next) tail.push(["дальше: ", step.next === "end" ? "конец" : step.next]);
+    if (step.kind === "condition") { /* оба выхода уже показаны в теле */ }
+    else if (step.next) tail.push(["дальше: ", step.next === "end" ? "конец" : step.next]);
     else if (d) tail.push(["дальше: ", d.next_resolved || "конец"]);
     if (d && d.reached_by && d.reached_by.length) {
       tail.push(["сюда ведёт: ", d.reached_by.map(function (r) { return r.step + " (" + (OUTCOMES[r.reply] || r.reply) + ")"; }).join(", ")]);
@@ -272,6 +330,7 @@
 
   // ---------- экраны ----------
   var tab = "funnels";
+  var canEdit = false;       // подсказка от сервера: показывать ли «Редактировать» (запись всё равно проверяется на сервере)
   var stack = [];            // экраны поверх главной: {title, render(body), refresh}
   var current = null;
 
@@ -285,7 +344,7 @@
     } else {
       var list = el("div", "flow"); box.appendChild(list);
       getJson("api/funnels").then(function (d) {
-        showError(""); list.textContent = "";
+        showError(""); list.textContent = ""; canEdit = !!d.can_edit;
         if (!d.funnels.length) list.appendChild(el("div", "card empty", "В конфиге нет воронок"));
         d.funnels.forEach(function (f) {
           var b = el("button", "rowlink"); b.type = "button";
@@ -313,7 +372,11 @@
     scr.render(body);
     window.scrollTo(0, 0);
   }
-  function back() { stack.pop(); show(); }
+  function back() {
+    var top = stack[stack.length - 1];
+    if (top && top.beforeBack && !top.beforeBack()) return;
+    stack.pop(); show();
+  }
 
   // воронка: сниппет + «Подробнее», ниже структура + «Редактировать»
   function funnelScreen(f) {
@@ -335,19 +398,237 @@
 
       body.appendChild(el("h2", "", "Структура воронки"));
       var flow = el("div", "flow");
+      flow.appendChild(renderTrigger());
       f.steps.forEach(function (st) { flow.appendChild(renderStep(st)); });   // просмотр: шаги не нажимаются
       body.appendChild(flow);
       body.appendChild(el("div", "gap"));
-      var edit = el("button", "btn", "Редактировать"); edit.type = "button";
-      edit.onclick = function () { push(editScreen(f)); };
-      body.appendChild(edit);
+      if (canEdit) {
+        var edit = el("button", "btn", "Редактировать"); edit.type = "button";
+        edit.onclick = function () { push(editScreen(f)); };
+        body.appendChild(edit);
+      }
     } };
   }
-  // заглушка: конструктор появится в следующей части
-  function editScreen(f) {
-    return { title: "Редактирование: " + f.key, render: function (body) {
-      body.appendChild(el("div", "card empty", "Редактор воронок появится в следующей версии."));
+  // ---------- редактор ----------
+  // Лента шагов — тот же renderStep, что в просмотре, но с onOpen: нажатие открывает экран правки шага.
+  // Правится копия (draft); на сервер она уходит целиком кнопкой «Сохранить», проверка и запись — на сервере.
+  var DELAY_RE = /^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$/, UNIT = { s: 1, m: 60, h: 3600, d: 86400 };
+  function parseDelay(t) {
+    if (t == null || String(t).trim() === "") return 0;
+    var m = DELAY_RE.exec(String(t));
+    return m ? parseFloat(m[1]) * UNIT[m[2] || "s"] : NaN;
+  }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function draftStep(st) {            // без вычисленных полей: они у черновика не нужны
+    var c = clone(st); delete c.derived;
+    return c;
+  }
+  function referrers(draft, key) {    // кто ведёт на шаг: next и on_reply других шагов
+    var out = [];
+    draft.forEach(function (s) {
+      if (s.key === key) return;
+      if (s.next === key) out.push(s.key + " (дальше)");
+      if (s.on_true === key) out.push(s.key + " (условие: да)");
+      if (s.on_false === key) out.push(s.key + " (условие: нет)");
+      Object.keys(s.on_reply || {}).forEach(function (o) { if (s.on_reply[o] === key) out.push(s.key + " (" + (OUTCOMES[o] || o) + ")"); });
+    });
+    return out;
+  }
+  function field(label, input, hint) {
+    var w = el("div", "field");
+    var l = el("label", "", label); w.appendChild(l); w.appendChild(input);
+    if (hint) w.appendChild(el("div", "hint", hint));
+    return w;
+  }
+  function textInput(value, ro) {
+    var i = el("input"); i.type = "text"; i.value = value || ""; i.readOnly = !!ro; i.autocomplete = "off"; return i;
+  }
+  function keySelect(draft, selfKey, value, extra) {      // цели берутся из существующих шагов: битой ссылки не будет
+    var sel = el("select");
+    (extra || []).forEach(function (o) { var op = el("option", "", o[1]); op.value = o[0]; sel.appendChild(op); });
+    draft.forEach(function (s) {
+      if (s.key === selfKey) return;
+      var op = el("option", "", s.key); op.value = s.key; sel.appendChild(op);
+    });
+    sel.value = value || (extra && extra.length ? extra[0][0] : "");
+    return sel;
+  }
+
+  // поля экрана правки по виду шага; новый вид шага = новая функция здесь и в STEP_BODY
+  var STEP_FIELDS = {
+    message: function (w, draft, box) {
+      var text = el("textarea"); text.value = w.text || "";
+      box.appendChild(field("Текст сообщения", text));
+      var sw = el("label", "switch"), cb = el("input"); cb.type = "checkbox"; cb.checked = !!w.request_phone;
+      sw.appendChild(cb); sw.appendChild(document.createTextNode("Просит номер телефона"));
+      var ph = el("div", "sub-fields");
+      var b1 = textInput(w.request_phone && w.request_phone.button || "📱 Поделиться номером");
+      var b2 = textInput(w.request_phone && w.request_phone.decline_button || "Не хочу делиться");
+      var others = draft.filter(function (s) { return s.key !== w.key; });
+      var onC = keySelect(draft, w.key, w.on_reply && w.on_reply.contact), onD = keySelect(draft, w.key, w.on_reply && w.on_reply.decline);
+      ph.appendChild(field("Кнопка запроса номера", b1));
+      ph.appendChild(field("Кнопка отказа", b2));
+      ph.appendChild(field("Прислал номер → шаг", onC, "Ответ отменяет ждущие шаги и ведёт сюда."));
+      ph.appendChild(field("Отказ (кнопкой или текстом) → шаг", onD));
+      if (!others.length) ph.appendChild(el("div", "msg bad", "Для запроса номера нужны ещё шаги — куда вести ответ. Сначала добавьте их."));
+      var sync = function () { ph.hidden = !cb.checked; };
+      cb.onchange = sync; sync();
+      box.appendChild(sw); box.appendChild(ph);
+      var nxt = keySelect(draft, w.key, w.next, [["", "по порядку (по умолчанию)"], ["end", "конец воронки"]]);
+      box.appendChild(field("Что дальше", nxt, "Явный следующий шаг. «По порядку» — сосед в ленте (шаги, куда ведёт ответ, по порядку не запускаются)."));
+      return function collect() {      // собрать значения из полей; строка — текст ошибки
+        if (!text.value.trim()) return "Текст сообщения не может быть пустым.";
+        var out = { text: text.value };
+        if (cb.checked) {
+          if (!others.length) return "Для запроса номера нужны ещё шаги.";
+          if (!b1.value.trim() || !b2.value.trim()) return "Заполните обе кнопки.";
+          out.request_phone = { button: b1.value.trim(), decline_button: b2.value.trim() };
+          out.on_reply = { contact: onC.value, decline: onD.value };
+        }
+        if (nxt.value) out.next = nxt.value; else out.next = null;
+        return out;
+      };
+    },
+    delay: function (w, draft, box) {
+      var dur = textInput(w.duration_text);
+      box.appendChild(field("Длительность", dur, "Примеры: 10s, 1m, 1h. Отсчёт от момента, когда отработал предыдущий шаг. Дальше — следующий шаг по списку."));
+      return function collect() {
+        var secs = parseDelay(dur.value);
+        if (dur.value.trim() === "" || isNaN(secs)) return "Длительность: не понимаю «" + dur.value + "». Пример: 10s, 1m, 1h.";
+        return { duration: secs, duration_text: dur.value.trim() };
+      };
+    },
+    condition: function (w, draft, box) {
+      var kind = el("select");
+      [["phone_given", "номер оставлен"], ["tag", "есть метка"]].forEach(function (o) { var op = el("option", "", o[1]); op.value = o[0]; kind.appendChild(op); });
+      kind.value = (w.check && w.check.kind) || "phone_given";
+      var tag = textInput(w.check && w.check.tag);
+      var tagField = field("Метка", tag, "Имя метки пользователя, например vip.");
+      var sync = function () { tagField.hidden = kind.value !== "tag"; };
+      kind.onchange = sync; sync();
+      var exits = [["next", "следующий по списку"], ["end", "закончить прогон"]];
+      var yes = keySelect(draft, w.key, w.on_true, exits), no = keySelect(draft, w.key, w.on_false, exits);
+      box.appendChild(field("Проверка", kind));
+      box.appendChild(tagField);
+      box.appendChild(field("Если да → выход", yes, "Следующий по списку, закончить прогон или конкретный шаг."));
+      box.appendChild(field("Если нет → выход", no));
+      return function collect() {
+        var check = { kind: kind.value };
+        if (kind.value === "tag") {
+          if (!tag.value.trim()) return "Укажите метку.";
+          check.tag = tag.value.trim();
+        }
+        return { check: check, on_true: yes.value, on_false: no.value };
+      };
+    }
+  };
+  var KIND_FIELDS_ALL = ["text", "request_phone", "on_reply", "next", "duration", "duration_text", "check", "on_true", "on_false"];
+
+  function stepScreen(draft, idx, isNew, done, fresh) {
+    var w = isNew ? clone(fresh) : clone(draft[idx]);      // новый шаг попадает в ленту только по «Готово»
+    return { title: isNew ? "Новый шаг" : "Шаг: " + w.key, render: function (body) {
+      var msg = el("div", "msg bad"); msg.hidden = true;
+      body.appendChild(msg);
+      var key = textInput(w.key, !isNew);
+      body.appendChild(field("Ключ шага", key, isNew ? "Латиница, цифры, _ и -. Потом изменить нельзя: на ключ ссылаются другие шаги." : "Ключ не меняется: на него ссылаются другие шаги."));
+      var kinds = el("select"); Object.keys(STEP_FIELDS).forEach(function (k) { var o = el("option", "", KIND_RU[k] || k); o.value = k; kinds.appendChild(o); });
+      kinds.value = w.kind; kinds.disabled = !isNew;     // вид спрашивается при добавлении; у существующего шага не меняется
+      body.appendChild(field("Вид шага", kinds, isNew ? "" : "Вид не меняется: добавьте новый шаг и удалите старый."));
+      var fields = el("div"); body.appendChild(fields);
+      var collect;
+      function build() { fields.textContent = ""; w.kind = kinds.value; collect = (STEP_FIELDS[w.kind] || STEP_FIELDS.message)(w, draft, fields); }
+      kinds.onchange = build; build();
+      var ok = el("button", "btn primary", "Готово"); ok.type = "button";
+      ok.onclick = function () {
+        var k = key.value.trim();
+        if (isNew) {
+          if (!/^[A-Za-z0-9_-]+$/.test(k) || k === "end" || k === "next") { msg.textContent = "Ключ: латиница, цифры, _ и -, не «end» и не «next»."; msg.hidden = false; return; }
+          if (draft.some(function (s, i) { return i !== idx && s.key === k; })) { msg.textContent = "Шаг с ключом «" + k + "» уже есть."; msg.hidden = false; return; }
+        }
+        var got = collect();
+        if (typeof got === "string") { msg.textContent = got; msg.hidden = false; return; }
+        var next = clone(w); next.key = k; next.kind = kinds.value;
+        KIND_FIELDS_ALL.forEach(function (f) { delete next[f]; });
+        Object.keys(got).forEach(function (f) { if (got[f] !== null) next[f] = got[f]; });
+        draft[idx] = next;
+        done(); back();
+      };
+      body.appendChild(ok);
     } };
+  }
+
+  function editScreen(f) {
+    var draft = f.steps.map(draftStep), dirty = false;
+    var scr = { title: "Редактирование: " + f.key };
+    scr.beforeBack = function () { return !dirty || window.confirm("Выйти без сохранения изменений?"); };
+    scr.render = function (body) {
+      var msg = el("div", "msg"); msg.hidden = true;
+      function say(text, good) { msg.textContent = text || ""; msg.className = "msg " + (good ? "good" : "bad"); msg.hidden = !text; }
+      body.appendChild(msg);
+      body.appendChild(el("div", "note", "Нажмите на шаг, чтобы изменить. Изменения попадут в файл конфига после «Сохранить» и сразу действуют на тех, кто уже идёт по воронке."));
+      var flow = el("div", "flow"); body.appendChild(flow);
+      function touch() { dirty = true; paint(); }
+      function paint() {
+        flow.textContent = "";
+        flow.appendChild(renderTrigger());
+        draft.forEach(function (st, i) {
+          var wrap = el("div");
+          wrap.appendChild(renderStep(st, { onOpen: function () {
+            push(stepScreen(draft, i, false, function () { dirty = true; }));
+          } }));
+          var tools = el("div", "tools");
+          function tool(label, cls, fn, off) {
+            var b = el("button", "btn " + cls, label); b.type = "button"; if (off) b.setAttribute("disabled", ""); b.onclick = fn; tools.appendChild(b);
+          }
+          tool("↑ выше", "", function () { draft.splice(i - 1, 0, draft.splice(i, 1)[0]); touch(); }, i === 0);
+          tool("↓ ниже", "", function () { draft.splice(i + 1, 0, draft.splice(i, 1)[0]); touch(); }, i === draft.length - 1);
+          tool("Удалить", "danger", function () {
+            var by = referrers(draft, st.key);
+            if (draft.length === 1) return say("В воронке должен остаться хотя бы один шаг.");
+            if (by.length) return say("Шаг «" + st.key + "» удалить нельзя: на него ведут " + by.join(", ") + ". Сначала измените эти шаги.");
+            if (!window.confirm("Удалить шаг «" + st.key + "»?")) return;
+            say(""); draft.splice(i, 1); touch();
+          });
+          wrap.appendChild(tools); flow.appendChild(wrap);
+        });
+      }
+      paint();
+      body.appendChild(el("div", "gap"));
+      var add = el("button", "btn", "+ Добавить шаг"); add.type = "button";
+      add.onclick = function () {
+        var n = 1; while (draft.some(function (s) { return s.key === "step_" + n; })) n++;
+        var fresh = { key: "step_" + n, kind: "message", text: "" };
+        push(stepScreen(draft, draft.length, true, function () { dirty = true; }, fresh));
+      };
+      body.appendChild(add);
+      var bar = el("div", "savebar");
+      var save = el("button", "btn primary", "Сохранить"); save.type = "button";
+      save.onclick = function () {
+        save.setAttribute("disabled", ""); say("");
+        var payload = draft.map(function (s) {
+          var o = { key: s.key, kind: s.kind };
+          if (s.kind === "delay") o.duration = s.duration_text || "";
+          else if (s.kind === "condition") { o.check = s.check; o.on_true = s.on_true; o.on_false = s.on_false; }
+          else {
+            o.text = s.text;
+            if (s.request_phone) o.request_phone = s.request_phone;
+            if (s.on_reply) o.on_reply = s.on_reply;
+            if (s.next) o.next = s.next;
+          }
+          return o;
+        });
+        postJson("api/funnels/" + encodeURIComponent(f.key), { steps: payload }).then(function (r) {
+          save.removeAttribute("disabled");
+          if (r.status === 200) {
+            f.steps = r.body.funnel.steps; draft = f.steps.map(draftStep); dirty = false; paint();
+            say("Сохранено. Бот уже работает по новому конфигу.", true);
+          } else if (r.status === 403) say("Править воронки могут только администраторы.");
+          else say(r.body && r.body.error ? "Не сохранено: " + r.body.error : "Не сохранено: ошибка " + r.status);
+        }).catch(function () { save.removeAttribute("disabled"); say("Не сохранено: нет связи с сервером."); });
+      };
+      bar.appendChild(save); body.appendChild(bar);
+    };
+    return scr;
   }
 
   // страница воронки: три уровня, шаги по статусам, события

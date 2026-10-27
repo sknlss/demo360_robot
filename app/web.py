@@ -5,7 +5,7 @@ import os
 from aiohttp import web
 
 from . import api
-from .auth import authorize
+from .auth import access
 
 log = logging.getLogger("funnel.web")
 STATIC = os.path.join(os.path.dirname(__file__), "static")
@@ -15,13 +15,12 @@ STATIC = os.path.join(os.path.dirname(__file__), "static")
 async def auth_middleware(request, handler):
     if request.path.startswith("/api/"):
         s = request.app["settings"]
-        ok, reveal, why = authorize(request.headers.get("X-Init-Data", ""), disabled=s.auth_disabled,
-                                    token=s.bot_token, admin_ids=s.admin_ids,
-                                    max_age=s.init_data_max_age)
-        if not ok:
-            log.info("доступ закрыт: %s", why)
+        a = access(request.headers.get("X-Init-Data", ""), disabled=s.auth_disabled,
+                   token=s.bot_token, admin_ids=s.admin_ids, max_age=s.init_data_max_age)
+        if not a.ok:
+            log.info("доступ закрыт: %s", a.why)
             return web.json_response({"error": "forbidden"}, status=403)
-        request["reveal"] = reveal
+        request["reveal"], request["can_edit"] = a.reveal, a.can_edit
     return await handler(request)
 
 
@@ -36,7 +35,17 @@ def _state(request):
 
 
 async def api_funnels(request):
-    return web.json_response(api.funnels_payload(*_state(request)))
+    return web.json_response(api.funnels_payload(*_state(request), can_edit=request.get("can_edit", False)))
+
+
+async def api_save_funnel(request):
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    code, out = api.save_funnel_payload(request.app["cfg"], request.match_info["key"], body,
+                                        request.get("can_edit", False))
+    return web.json_response(out, status=code)
 
 
 async def api_overview(request):
@@ -77,6 +86,7 @@ def make_app(db, cfg, settings, photos=None) -> web.Application:
     app["db"], app["cfg"], app["settings"], app["photos"] = db, cfg, settings, photos
     app.router.add_get("/", index)
     app.router.add_get("/api/funnels", api_funnels)
+    app.router.add_post("/api/funnels/{key}", api_save_funnel)
     app.router.add_get("/api/overview", api_overview)
     app.router.add_get("/api/users", api_users)
     app.router.add_get("/api/photo/{user_id}", api_photo)

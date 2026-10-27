@@ -15,10 +15,17 @@ from urllib.parse import parse_qs, urlparse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+
+def read(path, mode="r"):
+    with open(path, mode, **({} if "b" in mode else {"encoding": "utf-8"})) as f:
+        return f.read()
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 from app import api  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.config import parse_config  # noqa: E402
+from app.configstore import ConfigStore  # noqa: E402
+from app.config_edit import JsonCodec  # noqa: E402
 
 
 def seed():
@@ -53,20 +60,26 @@ def seed():
     db.conn.execute("INSERT INTO queue(run_id,user_id,funnel,step_key,due_at,status) VALUES (?,?,?,?,?,'cancelled')",
                     (runs[4], 4, "signup", "welcome", t))
     db.conn.execute("INSERT INTO queue(run_id,user_id,funnel,step_key,due_at,status) VALUES (?,?,?,?,?,'expired')",
-                    (runs[2], 2, "signup", "m1", t))
+                    (runs[2], 2, "signup", "d1", t))
     db.conn.execute("INSERT INTO users(tg_id,name,username,created_at,tags) VALUES (6,'Игорь','igor',?,'[]')", (t - 7 * 3600,))
     cur = db.conn.execute("INSERT INTO runs(user_id,funnel,status,started_at) VALUES (6,'plain','completed',?)", (t,))
     db.log_event(t - 7 * 3600, "run_started", 6, cur.lastrowid, "plain")
     db.log_event(t - 7 * 3600 + 1, "message_sent", 6, cur.lastrowid, "a")
-    for k, (kind, d) in enumerate([("step_expired", "m1"), ("send_failed", "m1: Blocked: Forbidden: bot was blocked by the user"),
+    for k, (kind, d) in enumerate([("step_expired", "d1"), ("send_failed", "m1: Blocked: Forbidden: bot was blocked by the user"),
                                    ("run_cancelled", "повторный /start, отменено ждущих: 1"),
                                    ("phone_declined", None)]):
         db.log_event(t + k * 60, kind, k % 5 + 1, runs[k % 5 + 1], d)
-    db.log_event(t + 400, "start_blocked", 1, None, "signup")
-    return db, parse_config(RAW)
+    db.log_event(t + 400, "condition", 1, runs[1], "has_phone: да → already")
+    # конфиг лежит файлом (JSON — подмножество YAML), чтобы редактор писал в настоящий файл и бот-подобный
+    # ConfigStore подхватывал правки; ruamel/PyYAML для предпросмотра не нужны
+    path = os.path.join(tempfile.mkdtemp(), "funnels.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(JsonCodec().dump(RAW))
+    return db, ConfigStore(path, loader=lambda p: parse_config(json.loads(read(p))))
 
 
 db, cfg = seed()
+CODEC = JsonCodec()
 REVEAL = os.environ.get("REVEAL") == "1"
 TOKEN = os.environ.get("PREVIEW_TOKEN", "")
 ADMINS = frozenset(int(x) for x in os.environ.get("PREVIEW_ADMIN_IDS", "").split(",") if x)
@@ -82,20 +95,40 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        u = urlparse(self.path)
+        can_edit = REVEAL
+        if TOKEN:
+            from app.auth import access
+            a = access(self.headers.get("X-Init-Data", ""), disabled=False, token=TOKEN,
+                       admin_ids=ADMINS, max_age=86400)
+            if not a.ok:
+                return self.send(b'{"error": "forbidden"}', "application/json", 403)
+            can_edit = a.can_edit
+        if not u.path.startswith("/api/funnels/"):
+            return self.send(b"{}", "application/json", 404)
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"null")
+        except ValueError:
+            body = None
+        code, out = api.save_funnel_payload(cfg, u.path[len("/api/funnels/"):], body, can_edit, codec=CODEC)
+        self.send(json.dumps(out).encode(), "application/json", code)
+
     def do_GET(self):
         u = urlparse(self.path)
-        reveal = REVEAL
+        reveal = can_edit = REVEAL
         q = parse_qs(u.query)
         if TOKEN and u.path.startswith("/api/"):
-            from app.auth import authorize
-            ok, reveal, _ = authorize(self.headers.get("X-Init-Data", ""), disabled=False, token=TOKEN,
-                                      admin_ids=ADMINS, max_age=86400)
-            if not ok:
+            from app.auth import access
+            a = access(self.headers.get("X-Init-Data", ""), disabled=False, token=TOKEN,
+                       admin_ids=ADMINS, max_age=86400)
+            if not a.ok:
                 return self.send(b'{"error": "forbidden"}', "application/json", 403)
+            reveal, can_edit = a.reveal, a.can_edit
         if u.path == "/":
-            self.send(open(os.path.join(ROOT, "app/static/index.html"), "rb").read(), "text/html; charset=utf-8")
+            self.send(read(os.path.join(ROOT, "app/static/index.html"), "rb"), "text/html; charset=utf-8")
         elif u.path == "/api/funnels":
-            self.send(json.dumps(api.funnels_payload(db.conn, cfg)).encode(), "application/json")
+            self.send(json.dumps(api.funnels_payload(db.conn, cfg, can_edit=can_edit)).encode(), "application/json")
         elif u.path == "/api/overview":
             body = api.overview_payload(db.conn, cfg, q.get("funnel", [None])[0])
             self.send(json.dumps(body).encode(), "application/json", 200 if body is not None else 404)

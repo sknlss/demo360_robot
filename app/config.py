@@ -37,8 +37,21 @@ def parse_duration(value, where: str) -> float:
     return seconds
 
 
-END = "end"  # значение `next`: после этого шага прогон завершается; ключ шага так назвать нельзя
+def format_duration(seconds: float) -> str:
+    """Секунды -> '10s' / '1m' / '1h' (обратное к parse_duration; редактор пишет задержки в этом виде)."""
+    n = int(seconds) if float(seconds).is_integer() else seconds
+    if isinstance(n, int) and n and n % 3600 == 0:
+        return f"{n // 3600}h"
+    if isinstance(n, int) and n and n % 60 == 0:
+        return f"{n // 60}m"
+    return f"{n}s"
+
+
+END = "end"    # значение `next` и выходов условия: прогон завершается; ключ шага так назвать нельзя
+NEXT = "next"  # выход условия «следующий шаг по списку»; ключ шага так назвать нельзя
+RESERVED_KEYS = (END, NEXT)
 REPLY_OUTCOMES = ("contact", "decline")  # ответы человека, из которых делается ветвление
+CHECK_KINDS = ("phone_given", "tag")     # проверки условия; вычисляются в app/checks.py (там тот же набор)
 
 
 @dataclass(frozen=True)
@@ -52,7 +65,6 @@ class PhoneRequest:
 class MessageStep:
     key: str
     text: str
-    delay: float = 0.0                          # секунд между отправкой предыдущего шага и этим
     request_phone: Optional[PhoneRequest] = None
     on_reply: tuple = ()                        # ((исход, ключ шага), ...): куда идти после ответа
     next: Optional[str] = None                  # явный следующий шаг, "end" или None = по умолчанию
@@ -62,20 +74,37 @@ class MessageStep:
         return dict(self.on_reply).get(outcome)
 
 
-ENTRY_KINDS = ("phone_given",)
+@dataclass(frozen=True)
+class DelayStep:
+    """Пауза. Сама ничего не отправляет; отработав, ведёт на следующий шаг по списку."""
+    key: str
+    duration: float                             # секунд
+    kind: str = "delay"
 
 
 @dataclass(frozen=True)
-class EntryCondition:
-    kind: str  # сейчас единственный вид: phone_given («человек уже оставил номер в этой воронке»)
-    reply: str
+class Check:
+    kind: str                                   # phone_given | tag
+    tag: Optional[str] = None                   # для tag: какая метка
+
+
+@dataclass(frozen=True)
+class ConditionStep:
+    """Проверка и два выхода. Каждый выход: «next» (следующий по списку), «end» (закончить прогон) или ключ шага."""
+    key: str
+    check: Check
+    on_true: str
+    on_false: str
+    kind: str = "condition"
+
+    def exit_for(self, result: bool) -> str:
+        return self.on_true if result else self.on_false
 
 
 @dataclass(frozen=True)
 class Funnel:
     key: str
     steps: tuple
-    entry_conditions: tuple = ()
 
     @property
     def first(self):
@@ -88,24 +117,45 @@ class Funnel:
         return None
 
     def branch_targets(self) -> set:
-        """Шаги, в которые попадают ответом человека: по списку в них не «проваливаются»."""
-        return {k for s in self.steps for _, k in s.on_reply}
+        """Шаги, в которые попадают ответом человека или выходом условия: по списку в них не «проваливаются»."""
+        out = {k for s in self.steps if s.kind == "message" for _, k in s.on_reply}
+        for s in self.steps:
+            if s.kind == "condition":
+                out |= {x for x in (s.on_true, s.on_false) if x not in RESERVED_KEYS}
+        return out
+
+    def neighbor(self, step):
+        i = self.steps.index(step)
+        return self.steps[i + 1] if i + 1 < len(self.steps) else None
 
     def next_step(self, step):
-        """Следующий шаг цепочки после `step` или None, если цепочка закончилась.
+        """Следующий шаг цепочки после сообщения или задержки; None — цепочка закончилась.
 
-        Явный `next` главнее. Иначе — сосед по списку, но только если он не цель ветвления:
-        шаги «спасибо» и «ладно, без номера» лежат в списке после напоминаний, и по порядку
-        на них никто не попадает."""
-        if step.next == END:
+        Явный `next` сообщения главнее. Иначе — сосед по списку, но только если он не цель ветвления:
+        шаги «спасибо» и «заявка у менеджера» лежат в списке после напоминаний, и по порядку на них
+        никто не попадает. У условия своих «дальше» нет: см. `exit_step`."""
+        if step.kind == "message" and step.next == END:
             return None
-        if step.next:
+        if step.kind == "message" and step.next:
             return self.step(step.next)
-        i = self.steps.index(step)
-        if i + 1 < len(self.steps) and self.steps[i + 1].key not in self.branch_targets():
-            return self.steps[i + 1]
-        return None
+        nb = self.neighbor(step)
+        return nb if nb is not None and nb.key not in self.branch_targets() else None
 
+    def exit_step(self, cond, result: bool):
+        """Шаг, куда ведёт выход условия: «next» — сосед по списку (буквально, без исключений), «end» — None."""
+        target = cond.exit_for(result)
+        if target == END:
+            return None
+        if target == NEXT:
+            return self.neighbor(cond)
+        return self.step(target)
+
+    def successors(self, step) -> list:
+        """Куда может пойти прогон без участия человека (для проверок конфига и страницы)."""
+        if step.kind == "condition":
+            return [x for x in (self.exit_step(step, True), self.exit_step(step, False)) if x is not None]
+        nxt = self.next_step(step)
+        return [nxt] if nxt is not None else []
 
 @dataclass(frozen=True)
 class Settings:
@@ -124,6 +174,11 @@ class Config:
     def funnel(self, key):
         return self.funnels.get(key)
 
+    def snapshot(self):
+        """Конфиг на один момент. Один проход петли или один обработчик берут снимок раз и не
+        обращаются к конфигу повторно: у ConfigStore то же имя возвращает текущий разбор."""
+        return self
+
 
 def _req(d: dict, name: str, where: str, typ=str):
     if not isinstance(d, dict):
@@ -141,6 +196,9 @@ def _parse_phone_request(raw, where: str) -> PhoneRequest:
 
 
 def _parse_message(raw: dict, where: str) -> MessageStep:
+    if "delay" in raw:
+        raise ConfigError(f"{where}.delay: у сообщения задержки больше нет — поставьте перед ним отдельный шаг "
+                          f"kind: delay с полем duration")
     phone = _parse_phone_request(raw["request_phone"], f"{where}.request_phone") if "request_phone" in raw else None
     on_reply = ()
     if "on_reply" in raw:
@@ -156,34 +214,52 @@ def _parse_message(raw: dict, where: str) -> MessageStep:
     nxt = raw.get("next")
     if nxt is not None and (not isinstance(nxt, str) or not nxt.strip()):
         raise ConfigError(f"{where}.next: нужен ключ шага или '{END}'")
-    return MessageStep(
-        key=raw["key"],
-        text=_req(raw, "text", where),
-        delay=parse_duration(raw.get("delay", 0), f"{where}.delay"),
-        request_phone=phone,
-        on_reply=on_reply,
-        next=nxt,
-    )
+    return MessageStep(key=raw["key"], text=_req(raw, "text", where), request_phone=phone,
+                       on_reply=on_reply, next=nxt)
 
 
-STEP_KINDS = {"message": _parse_message}
+def _parse_delay(raw: dict, where: str) -> DelayStep:
+    if "duration" not in raw:
+        raise ConfigError(f"{where}: нет поля 'duration' (например 10s, 1m)")
+    return DelayStep(key=raw["key"], duration=parse_duration(raw["duration"], f"{where}.duration"))
 
 
-def _parse_entry(raw: dict, where: str) -> EntryCondition:
+def _parse_check(raw, where: str) -> Check:
     kind = _req(raw, "kind", where)
-    if kind == "already_completed":
-        raise ConfigError(f"{where}.kind: условие 'already_completed' заменено на 'phone_given' (оставил номер): "
-                          f"напоминания без ответа воронку не завершают для этого условия")
-    if kind not in ENTRY_KINDS:
-        raise ConfigError(f"{where}.kind: неизвестное условие '{kind}' (есть: {', '.join(ENTRY_KINDS)})")
-    return EntryCondition(kind=kind, reply=_req(raw, "reply", where))
+    if kind not in CHECK_KINDS:
+        raise ConfigError(f"{where}.kind: неизвестная проверка '{kind}' (есть: {', '.join(CHECK_KINDS)})")
+    if kind == "tag":
+        return Check(kind=kind, tag=_req(raw, "tag", where))
+    return Check(kind=kind)
+
+
+def _parse_condition(raw: dict, where: str) -> ConditionStep:
+    exits = []
+    for name in ("on_true", "on_false"):
+        if name not in raw:
+            raise ConfigError(f"{where}: нет поля '{name}' — оба выхода условия указываются явно "
+                              f"({NEXT} / {END} / ключ шага)")
+        exits.append(_req(raw, name, where))
+    return ConditionStep(key=raw["key"], check=_parse_check(raw.get("check"), f"{where}.check"),
+                         on_true=exits[0], on_false=exits[1])
+
+
+STEP_KINDS = {"message": _parse_message, "delay": _parse_delay, "condition": _parse_condition}
 
 
 def _check_links(funnel: Funnel, where: str):
-    """Ссылки между шагами и ответы на запросы. Битая ссылка = прогон, который встанет на месте."""
+    """Ссылки между шагами, ответы на запросы, достижимость и зацикливание."""
     keys = {s.key for s in funnel.steps}
     for i, s in enumerate(funnel.steps):
         sw = f"{where}.steps[{i}] ('{s.key}')"
+        if s.kind == "condition":
+            for name in ("on_true", "on_false"):
+                t = getattr(s, name)
+                if t not in RESERVED_KEYS and t not in keys:
+                    raise ConfigError(f"{sw}.{name}: шага '{t}' нет в воронке")
+            continue
+        if s.kind != "message":
+            continue
         if s.on_reply and not s.request_phone:
             raise ConfigError(f"{sw}: on_reply есть, а request_phone нет — ответа ждать не от чего")
         if s.request_phone:
@@ -195,14 +271,43 @@ def _check_links(funnel: Funnel, where: str):
                 raise ConfigError(f"{sw}.on_reply.{outcome}: шага '{target}' нет в воронке")
         if s.next and s.next != END and s.next not in keys:
             raise ConfigError(f"{sw}.next: шага '{s.next}' нет в воронке")
-    # цепочка по next (без ветвлений, которые требуют ответа человека) не должна замыкаться
-    for s in funnel.steps:
-        seen, cur = set(), s
-        while cur is not None:
-            if cur.key in seen:
-                raise ConfigError(f"{where}: цепочка шагов зацикливается на '{cur.key}'")
-            seen.add(cur.key)
-            cur = funnel.next_step(cur)
+    # в каждый шаг должен быть путь от первого: по цепочке, выходу условия или ответу человека
+    reach, todo = set(), [funnel.steps[0]]
+    while todo:
+        cur = todo.pop()
+        if cur.key in reach:
+            continue
+        reach.add(cur.key)
+        todo.extend(funnel.successors(cur))
+        if cur.kind == "message":
+            todo.extend(funnel.step(k) for _, k in cur.on_reply)
+    for i, s in enumerate(funnel.steps):
+        if s.key not in reach:
+            raise ConfigError(f"{where}.steps[{i}] ('{s.key}'): в шаг нельзя попасть — на него не ведёт ни порядок "
+                              f"в списке, ни next, ни выход условия, ни on_reply")
+    # цикл без единой задержки крутится вечно (условия) или заспамит человека (сообщения). Цикл с задержкой —
+    # законная вещь. Ответы человека (on_reply) в цикл не входят: без человека они не срабатывают.
+    plain = {s.key: [n.key for n in funnel.successors(s)] for s in funnel.steps if s.kind != "delay"}
+    state = {}
+
+    def walk(k, path):
+        state[k] = 1
+        path.append(k)
+        for n in plain.get(k, ()):
+            if n not in plain:
+                continue  # задержка разрывает цикл
+            if state.get(n) == 1:
+                loop = path[path.index(n):] + [n]
+                raise ConfigError(f"{where}: цикл без задержки: {' → '.join(loop)}. "
+                                  f"Добавьте в цикл шаг kind: delay или разорвите его")
+            if n not in state:
+                walk(n, path)
+        path.pop()
+        state[k] = 2
+
+    for k in plain:
+        if k not in state:
+            walk(k, [])
 
 
 def _parse_funnel(key: str, raw: dict) -> Funnel:
@@ -212,7 +317,10 @@ def _parse_funnel(key: str, raw: dict) -> Funnel:
     for old in ("welcome", "phone"):
         if old in raw:
             raise ConfigError(f"{where}.{old}: поле убрано — приветствие и запрос номера теперь обычные шаги в steps "
-                              f"(см. funnels.yml в репозитории)")
+                              f"(см. config/funnels.yml в репозитории)")
+    if "entry_conditions" in raw:
+        raise ConfigError(f"{where}.entry_conditions: раздел убран — условие теперь обычный шаг kind: condition "
+                          f"в начале steps (см. config/funnels.yml в репозитории)")
     steps, seen = [], set()
     for i, s in enumerate(_req(raw, "steps", where, list)):
         sw = f"{where}.steps[{i}]"
@@ -220,19 +328,15 @@ def _parse_funnel(key: str, raw: dict) -> Funnel:
         kind = _req(s, "kind", sw)
         if kind not in STEP_KINDS:
             raise ConfigError(f"{sw}.kind: неизвестный вид '{kind}' (есть: {', '.join(STEP_KINDS)})")
-        if skey == END:
-            raise ConfigError(f"{sw}.key: '{END}' — служебное слово, ключ шага так назвать нельзя")
+        if skey in RESERVED_KEYS:
+            raise ConfigError(f"{sw}.key: '{skey}' — служебное слово, ключ шага так назвать нельзя")
         if skey in seen:
             raise ConfigError(f"{sw}.key: ключ шага '{skey}' повторяется")
         seen.add(skey)
         steps.append(STEP_KINDS[kind](s, sw))
     if not steps:
         raise ConfigError(f"{where}.steps: пустой список шагов")
-    conds = tuple(
-        _parse_entry(c, f"{where}.entry_conditions[{i}]")
-        for i, c in enumerate(raw.get("entry_conditions") or [])
-    )
-    funnel = Funnel(key=key, steps=tuple(steps), entry_conditions=conds)
+    funnel = Funnel(key=key, steps=tuple(steps))
     _check_links(funnel, where)
     return funnel
 
@@ -280,25 +384,44 @@ def load_config(path: str) -> Config:
 # попадают) — отдельно, в `derived`: черновик из редактора его не имеет, и отрисовка обходится без него.
 
 def step_to_dict(step, funnel: Optional[Funnel] = None) -> dict:
-    d = {"key": step.key, "kind": step.kind, "text": step.text, "delay": step.delay}
-    if step.request_phone:
-        d["request_phone"] = {"button": step.request_phone.button, "decline_button": step.request_phone.decline_button}
-    if step.on_reply:
-        d["on_reply"] = dict(step.on_reply)
-    if step.next:
-        d["next"] = step.next
+    d = {"key": step.key, "kind": step.kind}
+    if step.kind == "message":
+        d["text"] = step.text
+        if step.request_phone:
+            d["request_phone"] = {"button": step.request_phone.button,
+                                  "decline_button": step.request_phone.decline_button}
+        if step.on_reply:
+            d["on_reply"] = dict(step.on_reply)
+        if step.next:
+            d["next"] = step.next
+    elif step.kind == "delay":
+        d["duration"] = step.duration
+        d["duration_text"] = format_duration(step.duration)
+    else:
+        d["check"] = {"kind": step.check.kind, **({"tag": step.check.tag} if step.check.tag else {})}
+        d["on_true"], d["on_false"] = step.on_true, step.on_false
     if funnel is not None:
-        nxt = funnel.next_step(step)
+        # derived — вычисленное: куда пойдёт дальше и откуда сюда попадают; в YAML этого нет
+        derived = {}
+        if step.kind == "condition":
+            derived["exits"] = {name: (lambda t: t.key if t else None)(funnel.exit_step(step, r))
+                                for name, r in (("on_true", True), ("on_false", False))}
+        else:
+            nxt = funnel.next_step(step)
+            derived["next_resolved"] = nxt.key if nxt else None
         reached_by = []
         for s in funnel.steps:
-            for outcome, target in s.on_reply:
-                if target == step.key:
-                    reached_by.append({"step": s.key, "reply": outcome})
-        d["derived"] = {"next_resolved": nxt.key if nxt else None, "reached_by": reached_by}
+            if s.kind == "message":
+                reached_by += [{"step": s.key, "reply": o} for o, t in s.on_reply if t == step.key]
+            elif s.kind == "condition":
+                for name, r in (("on_true", True), ("on_false", False)):
+                    t = funnel.exit_step(s, r)
+                    if t is not None and t.key == step.key and getattr(s, name) != NEXT:
+                        reached_by.append({"step": s.key, "reply": name})
+        derived["reached_by"] = reached_by
+        d["derived"] = derived
     return d
 
 
 def funnel_to_dict(funnel: Funnel) -> dict:
-    return {"key": funnel.key,
-            "entry_conditions": [{"kind": c.kind, "reply": c.reply} for c in funnel.entry_conditions],
-            "steps": [step_to_dict(s, funnel) for s in funnel.steps]}
+    return {"key": funnel.key, "steps": [step_to_dict(s, funnel) for s in funnel.steps]}

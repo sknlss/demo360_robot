@@ -31,6 +31,7 @@ class TestStub(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.srv.shutdown()
+        cls.srv.server_close()
 
     def test_flow_and_error_modes(self):
         self.assertTrue(call(self.base, "/bot1:T/getMe")[1]["result"]["is_bot"])

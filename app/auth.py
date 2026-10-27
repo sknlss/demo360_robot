@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import time
+from dataclasses import dataclass
 from urllib.parse import parse_qsl
 
 
@@ -41,16 +42,30 @@ def verify_init_data(init_data: str, bot_token: str, max_age: int, now=None) -> 
     return user
 
 
-def authorize(init_data, *, disabled: bool, token: str, admin_ids, max_age: int, now=None):
-    """Решение для API дашборда: (пустить?, показывать ли полные телефоны?, причина).
+@dataclass(frozen=True)
+class Access:
+    ok: bool
+    reveal: bool = False    # видит телефоны целиком
+    can_edit: bool = False  # может менять воронки
+    why: str = ""
 
-    Единственное место, где читается флаг отключения и решается, кто видит номера целиком:
-    админы из ADMIN_IDS и режим DASHBOARD_AUTH_DISABLED. Остальным с подписью номер замазывает сервер."""
+
+def access(init_data, *, disabled: bool, token: str, admin_ids, max_age: int, now=None) -> Access:
+    """Решение для API дашборда. Единственное место, где читается флаг отключения проверки и
+    решается, кто что может: админы из ADMIN_IDS и режим DASHBOARD_AUTH_DISABLED видят номера целиком и
+    правят воронки (без этого в локальном запуске редактор нельзя показать). Остальным с подписью
+    номер замазывает сервер, а запись в конфиг закрыта."""
     if disabled:
-        return True, True, "проверка отключена (DASHBOARD_AUTH_DISABLED)"
+        return Access(True, True, True, "проверка отключена (DASHBOARD_AUTH_DISABLED)")
     try:
         user = verify_init_data(init_data, token, max_age, now)
     except AuthError as e:
-        return False, False, str(e)
-    reveal = int(user["id"]) in admin_ids
-    return True, reveal, f"user {user['id']}" + (" (админ)" if reveal else "")
+        return Access(False, False, False, str(e))
+    admin = int(user["id"]) in admin_ids
+    return Access(True, admin, admin, f"user {user['id']}" + (" (админ)" if admin else ""))
+
+
+def authorize(init_data, **kw):
+    """(пустить?, показывать ли полные телефоны?, причина) — короткая форма `access`."""
+    a = access(init_data, **kw)
+    return a.ok, a.reveal, a.why

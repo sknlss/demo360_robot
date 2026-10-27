@@ -93,12 +93,12 @@ def runs_summary(conn, funnel=None):
 
 
 def recent_events(conn, limit: int = 50, funnel=None):
-    """События воронки: по прогону; события без прогона (повторный старт при условии на входе) — по details."""
+    """События воронки — по прогону."""
     rows = conn.execute(
         "SELECT e.id, e.ts, e.kind, e.details, e.user_id, e.run_id, u.name, u.username "
         "FROM events e LEFT JOIN users u ON u.tg_id=e.user_id LEFT JOIN runs r ON r.id=e.run_id "
-        "WHERE (? IS NULL OR r.funnel=? OR (e.run_id IS NULL AND e.kind='start_blocked' AND e.details=?)) "
-        "ORDER BY e.id DESC LIMIT ?", (funnel, funnel, funnel, limit)).fetchall()
+        "WHERE (? IS NULL OR r.funnel=?) "
+        "ORDER BY e.id DESC LIMIT ?", (funnel, funnel, limit)).fetchall()
     return [dict(r) for r in rows]
 
 

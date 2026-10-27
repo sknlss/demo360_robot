@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .errors import Blocked, RetryAfter, SendError
-from .plan import enqueue_step, jump
+from .plan import abort_run, enter, jump
 
 log = logging.getLogger("funnel.service")
 
@@ -99,27 +99,19 @@ class FunnelService:
 
     # ---------- /start ----------
     async def start(self, user: UserInfo, funnel_key: Optional[str] = None) -> str:
-        """Возвращает 'blocked' | 'restarted' | 'new'."""
+        """Возвращает 'restarted' (прежний прогон отменён) | 'new'."""
         async with self._lock(user.tg_id):
             now = self.clock()
-            funnel = self.cfg.funnel(funnel_key) if funnel_key else None
+            cfg = self.cfg.snapshot()
+            funnel = cfg.funnel(funnel_key) if funnel_key else None
             if funnel is None:
                 if funnel_key:
                     log.info("неизвестная воронка %r, беру по умолчанию", funnel_key)
-                funnel = self.cfg.funnel(self.cfg.settings.default_funnel)
+                funnel = cfg.funnel(cfg.settings.default_funnel)
             self._upsert_user(user, now)
 
-            # случай 1: условие на входе
-            # «оставил номер» — по воронке: метка phone:<воронка>. Напоминания, кончившиеся без ответа,
-            # и отказ её не ставят, поэтому такой человек начинает воронку заново.
-            left_phone = has_tag(self.db.conn, user.tg_id, f"phone:{funnel.key}")
-            for cond in funnel.entry_conditions:
-                if cond.kind == "phone_given" and left_phone:
-                    self.db.log_event(now, "start_blocked", user.tg_id, None, funnel.key)
-                    await self._say(user.tg_id, None, cond.reply)
-                    return "blocked"
-
-            # случаи 2 и 3: одна транзакция — отмена прежнего и создание нового
+            # случаи 2 и 3 (случай «уже оставил номер» — теперь шаг-условие воронки, он вычисляется ниже,
+            # в enter): одна транзакция — отмена прежнего и создание нового
             outcome = "new"
             with self.db.tx() as c:
                 old = c.execute("SELECT id FROM runs WHERE user_id=? AND status='active'",
@@ -138,7 +130,7 @@ class FunnelService:
                 run_id = cur.lastrowid
                 self.db.log_event(now, "run_started", user.tg_id, run_id, funnel.key)
 
-                enqueue_step(c, run_id, user.tg_id, funnel, funnel.first, now)
+                enter(c, run_id, user.tg_id, funnel, funnel.first, now, self.db.log_event)
             self._notify()
             return outcome
 
@@ -146,20 +138,31 @@ class FunnelService:
     async def contact(self, user_id: int, phone: str, contact_user_id: Optional[int]) -> str:
         async with self._lock(user_id):
             run = self._awaiting_run(user_id)
-            funnel = self.cfg.funnel(run["funnel"]) if run else None
-            step = funnel.step(run["awaiting_step"]) if funnel else None
-            if step is None or step.request_phone is None:
+            if run is None:
                 return "ignored"
+            cfg = self.cfg.snapshot()
+            funnel = cfg.funnel(run["funnel"])
+            step = funnel.step(run["awaiting_step"]) if funnel else None
             if contact_user_id is not None and contact_user_id != user_id:
-                await self._say(user_id, run["id"], step.text, **_phone_kw(step))
+                if step is not None and step.request_phone is not None:
+                    await self._say(user_id, run["id"], step.text, **_phone_kw(step))
                 return "foreign"
             now = self.clock()
+            if step is None or step.request_phone is None:
+                # шаг запроса убрали правкой конфига, а номер уже прислан: номер не теряем, прогон закрываем
+                with self.db.tx() as c:
+                    c.execute("UPDATE users SET phone=? WHERE tg_id=?", (phone, user_id))
+                    add_tag(c, user_id, "phone")
+                    add_tag(c, user_id, f"phone:{run['funnel']}")
+                    self.db.log_event(now, "phone_given", user_id, run["id"], run["awaiting_step"])
+                    abort_run(c, run["id"], user_id, now, f"шага запроса '{run['awaiting_step']}' нет в конфиге")
+                return "accepted"
             with self.db.tx() as c:
                 c.execute("UPDATE users SET phone=? WHERE tg_id=?", (phone, user_id))
                 add_tag(c, user_id, "phone")
                 add_tag(c, user_id, f"phone:{funnel.key}")
                 self.db.log_event(now, "phone_given", user_id, run["id"], step.key)
-                jump(c, run["id"], user_id, funnel, step.reply_target("contact"), now)
+                jump(c, run["id"], user_id, funnel, step.reply_target("contact"), now, self.db.log_event)
             self._notify()
             return "accepted"
 
@@ -167,15 +170,20 @@ class FunnelService:
         """Отказ: кнопка «не хочу» или любой текст вместо контакта."""
         async with self._lock(user_id):
             run = self._awaiting_run(user_id)
-            funnel = self.cfg.funnel(run["funnel"]) if run else None
-            step = funnel.step(run["awaiting_step"]) if funnel else None
-            if step is None or step.request_phone is None:
+            if run is None:
                 return "ignored"
+            cfg = self.cfg.snapshot()
+            funnel = cfg.funnel(run["funnel"])
+            step = funnel.step(run["awaiting_step"]) if funnel else None
             now = self.clock()
+            if step is None or step.request_phone is None:
+                with self.db.tx() as c:
+                    abort_run(c, run["id"], user_id, now, f"шага запроса '{run['awaiting_step']}' нет в конфиге")
+                return "ignored"
             with self.db.tx() as c:
                 add_tag(c, user_id, "phone_declined")
                 self.db.log_event(now, "phone_declined", user_id, run["id"], step.key)
-                jump(c, run["id"], user_id, funnel, step.reply_target("decline"), now)
+                jump(c, run["id"], user_id, funnel, step.reply_target("decline"), now, self.db.log_event)
             self._notify()
             return "declined"
 

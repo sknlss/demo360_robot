@@ -12,4 +12,6 @@ services:
       DB_PATH: /app/data/bot.db
     volumes:
       - ./data:/app/data
-      - ./funnels.yml:/app/funnels.yml:ro
+      # папкой, не файлом: редактор пишет во временный файл и подменяет им конфиг (os.replace);
+      # на файл, подключённый как отдельный bind-mount, такая подмена даёт EBUSY
+      - ./config:/app/config

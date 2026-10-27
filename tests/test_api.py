@@ -44,7 +44,7 @@ class TestLevels(Base):
         self.assertEqual(levels(self.db.conn, self.cfg), {"started": 2, "requested": 1, "phone": 0})
         self.assertEqual([u["tg_id"] for u in api.users_payload(self.db.conn, self.cfg, "started",
                                                                 funnel="plain")["users"]], [222])
-        self.assertEqual([s["step"] for s in stats.overview(self.db.conn, self.cfg, "plain")["steps"]], ["a", "b"])
+        self.assertEqual([s["step"] for s in stats.overview(self.db.conn, self.cfg, "plain")["steps"]], ["a", "wb", "b"])
 
     async def test_request_delivered_inside_cancelled_run_still_counts(self):
         await self.svc.start(self.u)
@@ -57,7 +57,8 @@ class TestLevels(Base):
         self.db.conn.execute("INSERT INTO queue(id,run_id,user_id,funnel,step_key,due_at,status) "
                              "VALUES (99,1,111,'signup','ask',0,'processing')")
         row["id"] = 99
-        self.worker._mark_sent(row)
+        f = self.cfg.funnel('signup')
+        self.worker._mark_sent(row, f, f.step('ask'))
         ev = self.q("SELECT run_id FROM events WHERE kind='phone_requested'")
         self.assertEqual(ev, [{"run_id": 1}])
         self.assertEqual(levels(self.db.conn, self.cfg)["requested"], 1)
@@ -74,12 +75,16 @@ class TestFunnelsPayload(Base):
         json.dumps(p, ensure_ascii=False)
         sig = next(f for f in p["funnels"] if f["key"] == "signup")
         self.assertTrue(sig["is_default"])
-        self.assertEqual([s["key"] for s in sig["steps"]], ["welcome", "ask", "m1", "m2", "thanks", "declined"])
-        ask = sig["steps"][1]
+        self.assertEqual([s["key"] for s in sig["steps"]], ["has_phone", "welcome", "ask", "d1", "m1", "d2", "m2", "already", "thanks", "declined"])
+        ask = sig["steps"][2]
         self.assertEqual(ask["request_phone"], {"button": "дать", "decline_button": "нет"})
         self.assertEqual(ask["on_reply"], {"contact": "thanks", "decline": "declined"})
-        self.assertEqual(sig["steps"][2]["delay"], 10.0)
-        self.assertEqual(sig["entry_conditions"], [{"kind": "phone_given", "reply": "ЗАЯВКА У МЕНЕДЖЕРА"}])
+        self.assertEqual(sig["steps"][3]["duration"], 10.0)
+        self.assertEqual(sig["steps"][3]["duration_text"], "10s")
+        cond = sig["steps"][0]
+        self.assertEqual((cond["check"], cond["on_true"], cond["on_false"]), ({"kind": "phone_given"}, "already", "next"))
+        self.assertEqual(cond["derived"]["exits"], {"on_true": "already", "on_false": "welcome"})   # «next» разрешён в ключ
+        self.assertNotIn("entry_conditions", sig)
         self.assertEqual([l["key"] for l in sig["levels"]], ["started", "requested", "phone"])
 
     def test_derived_is_separate_from_source_fields(self):
@@ -87,11 +92,13 @@ class TestFunnelsPayload(Base):
         thanks = next(s for s in f["steps"] if s["key"] == "thanks")
         self.assertEqual(thanks["derived"]["reached_by"], [{"step": "ask", "reply": "contact"}])
         self.assertIsNone(thanks["derived"]["next_resolved"])
-        m1 = next(s for s in f["steps"] if s["key"] == "m1")
-        self.assertEqual(m1["derived"]["next_resolved"], "m2")
-        for src in ("key", "kind", "text", "delay"):
-            self.assertIn(src, m1)
-        self.assertNotIn("next_resolved", m1)                # вычисленное только внутри derived
+        d1 = next(s for s in f["steps"] if s["key"] == "d1")
+        self.assertEqual(d1["derived"]["next_resolved"], "m1")           # пауза ведёт на следующий по списку
+        for src in ("key", "kind", "duration", "duration_text"):
+            self.assertIn(src, d1)
+        self.assertNotIn("next_resolved", d1)                # вычисленное только внутри derived
+        already = next(s for s in f["steps"] if s["key"] == "already")
+        self.assertEqual(already["derived"]["reached_by"], [{"step": "has_phone", "reply": "on_true"}])
 
     def test_payload_has_no_phone_numbers(self):
         self.db.conn.execute("INSERT INTO users(tg_id,name,phone,created_at,tags) VALUES (5,'x','+37499111222',1,'[]')")
@@ -131,20 +138,23 @@ class TestUsersAll(Base):
         self.assertEqual((len(p["users"]), p["total"], p["limit"]), (2, 5, 2))
 
 
-class TestEntryCondition(unittest.TestCase):
-    def test_old_already_completed_gives_readable_error(self):
-        raw = json.loads(json.dumps(RAW))
-        raw["funnels"]["signup"]["entry_conditions"] = [{"kind": "already_completed", "reply": "x"}]
-        with self.assertRaises(ConfigError) as cm:
-            parse_config(raw)
-        self.assertIn("phone_given", str(cm.exception))
+class TestOldFormatRejected(unittest.TestCase):
+    """Конфиг прежнего формата (у Олега на сервере может лежать он) не принимается молча: ошибка говорит, что делать."""
 
-    def test_unknown_kind(self):
+    def test_entry_conditions_removed(self):
         raw = json.loads(json.dumps(RAW))
-        raw["funnels"]["signup"]["entry_conditions"] = [{"kind": "zzz", "reply": "x"}]
+        raw["funnels"]["signup"]["entry_conditions"] = [{"kind": "phone_given", "reply": "x"}]
         with self.assertRaises(ConfigError) as cm:
             parse_config(raw)
-        self.assertIn("phone_given", str(cm.exception))
+        self.assertIn("entry_conditions: раздел убран", str(cm.exception))
+        self.assertIn("kind: condition", str(cm.exception))
+
+    def test_message_delay_removed(self):
+        raw = json.loads(json.dumps(RAW))
+        raw["funnels"]["signup"]["steps"][1]["delay"] = "10s"
+        with self.assertRaises(ConfigError) as cm:
+            parse_config(raw)
+        self.assertIn("kind: delay", str(cm.exception))
 
 
 class TestPageSource(unittest.TestCase):
