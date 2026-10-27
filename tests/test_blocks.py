@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 
 from app import plan, stats  # noqa: E402
 from app.checks import CHECKS  # noqa: E402
-from app.config import CHECK_KINDS, ConfigError, parse_config  # noqa: E402
+from app.config import CHECK_KINDS, ConfigError, clean_tags, parse_config  # noqa: E402
 from app.service import FunnelService, UserInfo, add_tag  # noqa: E402
 from app.worker import Worker  # noqa: E402
 from test_core import Base, RAW  # noqa: E402
@@ -27,6 +27,10 @@ def cond(key, on_true, on_false, tag="vip"):
 
 def delay(key, duration):
     return {"key": key, "kind": "delay", "duration": duration}
+
+
+def tags(key, *names):
+    return {"key": key, "kind": "tags", "tags": list(names)}
 
 
 def raw_with(**funnels):
@@ -77,7 +81,7 @@ class TestShippedFunnel(Blocks):
         await self.svc.start(self.u)
         await self.drain(advance=100)
         self.assertEqual(self.sender.texts()[n:], ["ЗАЯВКА У МЕНЕДЖЕРА"])
-        self.assertEqual(self.q("SELECT COUNT(*) n FROM queue WHERE run_id=2 AND step_key='has_phone'")[0]["n"], 0)
+        self.assertEqual(self.q("SELECT COUNT(*) n FROM queue WHERE run_id=2 AND step_key='has_lead'")[0]["n"], 0)
 
     async def test_delay_step_gives_same_due_as_old_field(self):
         await self.svc.start(self.u)
@@ -224,6 +228,195 @@ class TestDelayInFlight(Blocks):
         self.assertEqual(self.open_rows(), [])
 
 
+class TestTagsStep(Blocks):
+    """Шаг «метки»: ставит метки, ничего не отправляет, проходится насквозь."""
+
+    def user_tags(self):
+        return json.loads(self.q("SELECT tags FROM users WHERE tg_id=111")[0]["tags"])
+
+    async def test_tag_set_and_seen_by_condition(self):
+        self.use([tags("t", "vip"), cond("c", "yes", "no"), msg("no", next="end"), msg("yes", next="end")])
+        await self.svc.start(self.u)
+        await self.drain()
+        self.assertIn("vip", self.user_tags())
+        self.assertEqual(self.sender.texts(), ["YES"])         # условие по метке увидело то, что поставил шаг
+
+    async def test_several_tags_at_once(self):
+        self.use([tags("t", "lead", "funnel_msg_1_sent", "Ключ2"), msg("m", next="end")])
+        await self.svc.start(self.u)
+        for t in ("lead", "funnel_msg_1_sent", "Ключ2"):
+            self.assertIn(t, self.user_tags())
+
+    async def test_repeat_does_not_duplicate(self):
+        self.use([tags("t1", "vip"), tags("t2", "vip", "vip"), msg("m", next="end")])
+        await self.svc.start(self.u)
+        await self.svc.start(self.u)                           # второй проход тем же пользователем
+        await self.drain()
+        self.assertEqual(self.user_tags().count("vip"), 1)
+
+    async def test_no_queue_rows_and_no_sends(self):
+        self.use([tags("t1", "a"), tags("t2", "b"), cond("c", "end", "end", tag="a")])
+        await self.svc.start(self.u)
+        await self.drain()
+        self.assertEqual(self.q("SELECT * FROM queue"), [])
+        self.assertEqual(self.sender.sent, [])
+        self.assertEqual(self.q("SELECT status FROM runs")[0]["status"], "completed")
+        ev = self.q("SELECT details FROM events WHERE kind='tags_set' ORDER BY id")
+        self.assertEqual([e["details"] for e in ev], ["t1: a", "t2: b"])
+
+    async def test_tags_after_delay_and_message(self):
+        self.use([msg("m", next="d"), delay("d", "10s"), tags("t", "reminded"), msg("z", next="end")])
+        await self.svc.start(self.u)
+        await self.drain()
+        self.assertNotIn("reminded", self.user_tags())
+        await self.drain(advance=11)
+        self.assertIn("reminded", self.user_tags())
+        self.assertEqual(self.sender.texts(), ["M", "Z"])
+
+    async def test_counts_towards_silent_limit(self):
+        self.use([tags(f"t{i}", f"x{i}") for i in range(5)] + [msg("m", next="end")])
+        with mock.patch.object(plan, "MAX_SILENT_STEPS", 3):
+            await self.svc.start(self.u)
+        await self.drain()
+        self.assertEqual(self.q("SELECT status FROM runs")[0]["status"], "cancelled")
+        self.assertIn("предел шагов без отправки (3)", self.q("SELECT details FROM events WHERE kind='run_cancelled'")[0]["details"])
+
+    def test_cycle_of_tag_steps_without_delay_is_rejected(self):
+        with self.assertRaisesRegex(ConfigError, "цикл без задержки"):
+            parse_config(raw_with(f=[tags("a", "x"), tags("b", "y"), cond("c", "a", "end")]))
+        parse_config(raw_with(f=[tags("a", "x"), delay("d", "1s"), cond("c", "a", "end")]))   # с задержкой законно
+
+    def test_config_rejects_bad_tags(self):
+        for bad in ([], ["ok", "две метки"], ["a-b"], ["a,b"], [""], "vip"):
+            with self.assertRaisesRegex(ConfigError, "tags"):
+                parse_config(raw_with(f=[{"key": "t", "kind": "tags", "tags": bad}]))
+        with self.assertRaisesRegex(ConfigError, "tags"):
+            parse_config(raw_with(f=[{"key": "t", "kind": "tags"}]))
+
+    def test_clean_tags_drops_garbage_keeps_good(self):
+        self.assertEqual(clean_tags("lead, funnel_msg_1_sent, bad tag, a-b, , x,y, lead, !!"),
+                         ["lead", "funnel_msg_1_sent", "x", "y"])
+        self.assertEqual(clean_tags(""), [])
+        self.assertEqual(clean_tags(None), [])
+
+
+class TestChecks(Blocks):
+    """Проверок ровно две: «метка» читает метки, «номер» читает поле телефона. Друг от друга не зависят."""
+
+    def pcond(self, kind):
+        check = {"kind": "tag", "tag": "signup_lead"} if kind == "tag" else {"kind": "phone"}
+        return [{"key": "c", "kind": "condition", "check": check, "on_true": "yes", "on_false": "no"},
+                msg("no", next="end"), msg("yes", next="end")]
+
+    async def go(self, kind, phone=None, tag=None):
+        self.use(self.pcond(kind))
+        u = UserInfo(5000 + len(self.sender.sent), "U")
+        await self.svc.start(u)                                          # заводит пользователя
+        with self.db.tx() as c:
+            if phone:
+                c.execute("UPDATE users SET phone=? WHERE tg_id=?", (phone, u.tg_id))
+            if tag:
+                add_tag(c, u.tg_id, tag)
+        before = len(self.sender.sent)
+        await self.svc.start(u)
+        await self.drain()
+        return [t for c, t, _ in self.sender.sent[before:] if c == u.tg_id]
+
+    async def test_phone_check_true_when_phone_in_db_without_any_tag(self):
+        self.assertEqual(await self.go("phone", phone="+37400000001"), ["YES"])
+
+    async def test_phone_check_false_without_phone(self):
+        self.assertEqual(await self.go("phone"), ["NO"])
+
+    async def test_phone_check_ignores_tags(self):
+        # метка «phone»/«phone:f» (старый механизм) есть, поля нет — проверка по номеру не срабатывает
+        self.assertEqual(await self.go("phone", tag="phone"), ["NO"])
+
+    async def test_tag_check_ignores_phone_field(self):
+        self.assertEqual(await self.go("tag", phone="+37400000002"), ["NO"])
+
+    async def test_tag_check_true_with_tag_and_no_phone(self):
+        self.assertEqual(await self.go("tag", tag="signup_lead"), ["YES"])
+
+    def test_old_check_name_rejected_with_explanation(self):
+        raw = raw_with(f=[{"key": "c", "kind": "condition", "check": {"kind": "phone_given"},
+                           "on_true": "end", "on_false": "end"}])
+        with self.assertRaises(ConfigError) as cm:
+            parse_config(raw)
+        text = str(cm.exception)
+        self.assertIn("phone_given", text)
+        self.assertIn("убрана", text)
+        self.assertIn("'phone'", text)
+        self.assertIn("'tag'", text)
+
+    def test_unknown_check_lists_the_two(self):
+        raw = raw_with(f=[{"key": "c", "kind": "condition", "check": {"kind": "zzz"},
+                           "on_true": "end", "on_false": "end"}])
+        with self.assertRaisesRegex(ConfigError, r"есть: tag, phone"):
+            parse_config(raw)
+
+    def test_tag_check_needs_tag_and_phone_check_needs_nothing(self):
+        raw = raw_with(f=[{"key": "c", "kind": "condition", "check": {"kind": "tag"}, "on_true": "end", "on_false": "end"}])
+        with self.assertRaises(ConfigError):
+            parse_config(raw)
+        parse_config(raw_with(f=[{"key": "c", "kind": "condition", "check": {"kind": "phone"},
+                                  "on_true": "end", "on_false": "end"}]))
+
+
+class TestShippedLead(Blocks):
+    """Поставляемая воронка сама ставит signup_lead и сама её проверяет."""
+
+    async def test_tags_step_sets_signup_lead_and_entry_condition_sees_it(self):
+        await self.svc.start(self.u)
+        await self.drain()
+        tags_before = json.loads(self.q("SELECT tags FROM users WHERE tg_id=111")[0]["tags"])
+        self.assertNotIn("signup_lead", tags_before)
+        await self.svc.contact(111, "+37400000000", 111)
+        await self.drain()
+        self.assertIn("signup_lead", json.loads(self.q("SELECT tags FROM users WHERE tg_id=111")[0]["tags"]))
+        self.assertEqual(self.q("SELECT COUNT(*) n FROM queue WHERE step_key='set_lead'")[0]["n"], 0)  # в очередь не встаёт
+        self.assertEqual(self.q("SELECT status FROM runs ORDER BY id DESC")[0]["status"], "completed")
+        n = len(self.sender.sent)
+        await self.svc.start(self.u)
+        await self.drain(advance=100)
+        self.assertEqual(self.sender.texts()[n:], ["ЗАЯВКА У МЕНЕДЖЕРА"])
+
+    async def test_decline_and_silence_start_over(self):
+        await self.svc.start(self.u)
+        await self.drain()
+        await self.svc.decline(111)
+        await self.drain()
+        n = len(self.sender.sent)
+        await self.svc.start(self.u)
+        await self.drain()
+        self.assertEqual(self.sender.texts()[n:], ["привет", "телефон?"])
+        await self.drain(advance=11)
+        await self.drain(advance=70)                          # напоминания кончились без ответа
+        n = len(self.sender.sent)
+        await self.svc.start(self.u)
+        await self.drain()
+        self.assertEqual(self.sender.texts()[n:], ["привет", "телефон?"])
+        self.assertNotIn("ЗАЯВКА У МЕНЕДЖЕРА", self.sender.texts())
+
+    async def test_funnel_works_with_prefix_changed_or_removed(self):
+        """Префикс signup_ — договорённость, не механизм: переименованная метка в обоих местах работает так же."""
+        steps = [dict(x) for x in RAW["funnels"]["signup"]["steps"]]
+        for x in steps:
+            if x["kind"] == "tags":
+                x["tags"] = ["lead"]
+            if x["kind"] == "condition":
+                x["check"] = {"kind": "tag", "tag": "lead"}
+        self.use(steps, key="signup")
+        await self.svc.start(self.u)
+        await self.drain()
+        await self.svc.contact(111, "+37400000000", 111)
+        await self.drain()
+        n = len(self.sender.sent)
+        await self.svc.start(self.u)
+        await self.drain()
+        self.assertEqual(self.sender.texts()[n:], ["ЗАЯВКА У МЕНЕДЖЕРА"])
+
+
 class TestRegistries(unittest.TestCase):
     def test_check_registries_match(self):
         self.assertEqual(set(CHECKS), set(CHECK_KINDS))
@@ -236,7 +429,7 @@ class TestStatsWithBlocks(Blocks):
         await self.drain(advance=11)
         rows = {s["step"]: s for s in stats.steps(self.db.conn, self.cfg, "signup")}
         self.assertEqual(rows["d1"]["sent"], 1)
-        self.assertEqual(rows["has_phone"]["sent"], 0)
+        self.assertEqual(rows["has_lead"]["sent"], 0)
         json.dumps(stats.overview(self.db.conn, self.cfg, "signup"))
 
 

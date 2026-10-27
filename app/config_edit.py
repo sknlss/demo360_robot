@@ -13,13 +13,14 @@ import os
 import tempfile
 import threading
 
-from .config import ConfigError, funnel_to_dict, parse_config, parse_duration
+from .config import ConfigError, clean_tags, funnel_to_dict, parse_config, parse_duration
 
-MANAGED = ("kind", "text", "duration", "check", "on_true", "on_false", "request_phone", "on_reply", "next")
+MANAGED = ("kind", "text", "duration", "tags", "check", "on_true", "on_false", "request_phone", "on_reply", "next")
 # какие поля бывают у какого вида: остальные из черновика отбрасываются на сервере, как бы ни была устроена форма
 KIND_FIELDS = {"message": ("text", "request_phone", "on_reply", "next"),
                "delay": ("duration",),
-               "condition": ("check", "on_true", "on_false")}
+               "condition": ("check", "on_true", "on_false"),
+               "tags": ("tags",)}
 _write_lock = threading.Lock()
 
 
@@ -97,6 +98,8 @@ def _clean_step(raw, i: int) -> dict:
     if "duration" in fields:
         duration = raw.get("duration")
         out["duration"] = duration.strip() if isinstance(duration, str) else duration
+    if "tags" in fields:
+        out["tags"] = clean_tags(raw.get("tags"))  # негодные метки молча отбрасываются; пусто — не пройдёт проверку
     if "check" in fields:
         check = raw.get("check")
         out["check"] = {k: v for k, v in dict(check).items() if v not in (None, "")} if isinstance(check, dict) else check

@@ -25,7 +25,10 @@ CODEC = JsonCodec()
 # воронка для правок без условия и «заявки у менеджера»: welcome, ask, d1(10s), m1, d2(1m), m2, thanks, declined.
 # Условие и пауза проверяются отдельно (TestBlocksEditing)
 E_RAW = copy.deepcopy(RAW)
-E_RAW["funnels"]["signup"]["steps"] = [x for x in RAW["funnels"]["signup"]["steps"] if x["key"] not in ("has_phone", "already")]
+E_RAW["funnels"]["signup"]["steps"] = [x for x in E_RAW["funnels"]["signup"]["steps"] if x["key"] not in ("has_lead", "already", "set_lead")]
+for _s in E_RAW["funnels"]["signup"]["steps"]:
+    if _s["key"] == "thanks":
+        _s["next"] = "end"
 
 
 def loader(p):
@@ -254,6 +257,15 @@ class TestBlocksEditing(EditBase):
         c = loader(self.path).funnel("signup").step("vip_check")
         self.assertEqual((c.on_true, c.on_false), ("welcome", "end"))
 
+    def test_phone_check_saved_without_tag_and_old_name_refused(self):
+        s = steps_of(E_RAW)
+        s.insert(0, self.cond_step(check={"kind": "phone", "tag": ""}))        # пустая метка из формы отбрасывается
+        self.save(s)
+        self.assertEqual(json.loads(self.text())["funnels"]["signup"]["steps"][0]["check"], {"kind": "phone"})
+        before = self.text()
+        self.refuse(lambda st: st[0].update(check={"kind": "phone_given"}), "phone_given")
+        self.assertEqual(self.text(), before)
+
     def test_delay_added_and_kind_change_drops_foreign_fields(self):
         s = steps_of(E_RAW)
         s.insert(1, {"key": "pause", "kind": "delay", "duration": "2m", "text": "лишнее", "next": "end", "on_true": "x"})
@@ -300,6 +312,26 @@ class TestBlocksEditing(EditBase):
             self.save(s)
         s[-1] = {"key": "back", "kind": "delay", "duration": "30s"}      # та же петля, но через паузу
         self.save(s)
+
+    def test_tags_step_saved_garbage_dropped_and_read_back(self):
+        s = steps_of(E_RAW)
+        s.insert(1, {"key": "mark", "kind": "tags", "tags": "lead, bad tag, a-b, funnel_msg_1_sent, lead, "})
+        self.save(s)
+        self.assertEqual(json.loads(self.text())["funnels"]["signup"]["steps"][1],
+                         {"key": "mark", "kind": "tags", "tags": ["lead", "funnel_msg_1_sent"]})
+        self.assertEqual(loader(self.path).funnel("signup").step("mark").tags, ("lead", "funnel_msg_1_sent"))
+        s = steps_of(json.loads(self.text()))
+        s[1]["tags"] = ["other"]
+        self.save(s)
+        self.assertEqual(loader(self.path).funnel("signup").step("mark").tags, ("other",))
+
+    def test_tags_step_with_only_garbage_is_refused(self):
+        s = steps_of(E_RAW)
+        s.insert(1, {"key": "mark", "kind": "tags", "tags": "плохая метка!, a-b"})
+        before = self.text()
+        with self.assertRaisesRegex((EditError, ConfigError), "tags"):
+            self.save(s)
+        self.assertEqual(self.text(), before)
 
     def test_unknown_kind_refused(self):
         self.refuse(lambda s: s[0].update(kind="poll"), "неизвестный вид")

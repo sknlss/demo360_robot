@@ -104,13 +104,22 @@ class TestRoundtrip(unittest.TestCase):
 
     def test_condition_and_delay_roundtrip(self):
         steps = draft(self.path)
-        by_key(steps, "has_phone")["on_false"] = "welcome"
+        by_key(steps, "has_lead")["on_false"] = "welcome"
         by_key(steps, "wait_1")["duration"] = "20s"
         self.save(steps)
         f = load_config(self.path).funnel("signup")
-        self.assertEqual((f.step("has_phone").on_true, f.step("has_phone").on_false), ("already", "welcome"))
+        self.assertEqual((f.step("has_lead").on_true, f.step("has_lead").on_false), ("already", "welcome"))
         self.assertEqual(f.step("wait_1").duration, 20.0)
         self.assertEqual(sorted(comments(read(self.path))), sorted(comments(self.orig)))
+
+    def test_tags_step_roundtrip_keeps_comments(self):
+        steps = draft(self.path)
+        k = [s["key"] for s in steps].index("welcome") + 1
+        steps.insert(k, {"key": "mark", "kind": "tags", "tags": "lead, плохая метка, funnel_msg_1_sent"})
+        self.save(steps)
+        self.assertEqual(load_config(self.path).funnel("signup").step("mark").tags, ("lead", "funnel_msg_1_sent"))
+        self.assertEqual(sorted(comments(read(self.path))), sorted(comments(self.orig)))
+        self.assertEqual(draft(self.path)[k]["tags"], ["lead", "funnel_msg_1_sent"])
 
     def test_refusal_leaves_file_byte_identical(self):
         steps = draft(self.path)

@@ -97,6 +97,8 @@
   .sc .btnline { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .sc .kb { padding: 3px 10px; border-radius: 8px; background: var(--line); font-size: 13px; }
   .sc .kb.no { opacity: .75; }
+  .tagline { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+  .tag { padding: 2px 10px; border-radius: 999px; background: var(--line); font-size: 13px; word-break: break-all; }
   .more { padding: 12px; text-align: center; color: var(--muted); font-size: 13px; }
   .gap { height: 10px; }
   .field { margin: 0 0 14px; }
@@ -154,10 +156,10 @@
     phone_declined: ["Отказался от телефона", "warn"], message_sent: ["Получил сообщение", "ok"],
     send_failed: ["Ошибка отправки", "bad"], run_cancelled: ["Прогон отменён", "warn"],
     run_completed: ["Прогон завершён", "ok"], step_expired: ["Шаг просрочен", "warn"],
-    condition: ["Проверено условие", ""]
+    condition: ["Проверено условие", ""], tags_set: ["Поставлены метки", ""]
   };
-  var KIND_RU = { message: "Сообщение", delay: "Задержка", condition: "Условие" };
-  var CHECK_RU = { phone_given: "номер оставлен" };
+  var KIND_RU = { message: "Сообщение", delay: "Задержка", condition: "Условие", tags: "Метки" };
+  var CHECK_RU = { phone: "номер указан в профиле" };
   var STAT = [["sent", "отправлено"], ["cancelled", "отменено"], ["expired", "просрочено"],
               ["error", "ошибок"], ["pending", "ждут"], ["processing", "в работе"]];
   var OUTCOMES = { contact: "прислал номер", decline: "отказ", on_true: "условие: да", on_false: "условие: нет" };
@@ -246,11 +248,18 @@
   STEP_BODY.delay = function (step, card) {
     card.appendChild(el("div", "text", "Пауза " + (step.duration_text || fmtDelay(step.duration)) + ", потом следующий шаг."));
   };
+  STEP_BODY.tags = function (step, card) {
+    var line = el("div", "tagline");
+    (step.tags || []).forEach(function (t) { line.appendChild(el("span", "tag", t)); });
+    card.appendChild(el("div", "text", "Ставит метки:"));
+    card.appendChild(line);
+    card.appendChild(el("div", "meta", "Ничего не отправляет, проходится сразу."));
+  };
   STEP_BODY.condition = function (step, card) {
     card.appendChild(el("div", "text", "Проверка: " + checkText(step.check || {})));
     var ex = step.derived && step.derived.exits;
-    card.appendChild(metaLine([["да → ", exitText(step.on_true, ex && ex.on_true)]]));
-    card.appendChild(metaLine([["нет → ", exitText(step.on_false, ex && ex.on_false)]]));
+    card.appendChild(metaLine([["Выход 1, верно → ", exitText(step.on_true, ex && ex.on_true)]]));
+    card.appendChild(metaLine([["Выход 2, не верно → ", exitText(step.on_false, ex && ex.on_false)]]));
   };
   // неизменяемый блок в начале ленты: с чего начинается воронка. Не шаг: в конфиг и в черновик не попадает
   function renderTrigger() {
@@ -500,18 +509,18 @@
     },
     condition: function (w, draft, box) {
       var kind = el("select");
-      [["phone_given", "номер оставлен"], ["tag", "есть метка"]].forEach(function (o) { var op = el("option", "", o[1]); op.value = o[0]; kind.appendChild(op); });
-      kind.value = (w.check && w.check.kind) || "phone_given";
+      [["tag", "есть метка"], ["phone", "заполнено поле телефона"]].forEach(function (o) { var op = el("option", "", o[1]); op.value = o[0]; kind.appendChild(op); });
+      kind.value = (w.check && w.check.kind) || "tag";
       var tag = textInput(w.check && w.check.tag);
       var tagField = field("Метка", tag, "Имя метки пользователя, например vip.");
       var sync = function () { tagField.hidden = kind.value !== "tag"; };
       kind.onchange = sync; sync();
       var exits = [["next", "следующий по списку"], ["end", "закончить прогон"]];
       var yes = keySelect(draft, w.key, w.on_true, exits), no = keySelect(draft, w.key, w.on_false, exits);
-      box.appendChild(field("Проверка", kind));
+      box.appendChild(field("Проверка", kind, "Метка — смотрит только метки пользователя. Телефон — смотрит только поле телефона в базе, метки не читает."));
       box.appendChild(tagField);
-      box.appendChild(field("Если да → выход", yes, "Следующий по списку, закончить прогон или конкретный шаг."));
-      box.appendChild(field("Если нет → выход", no));
+      box.appendChild(field("Выход 1 — проверка верна (да)", yes, "Куда идти, когда проверка верна: следующий по списку, закончить прогон или конкретный шаг."));
+      box.appendChild(field("Выход 2 — проверка не верна (нет)", no, "Куда идти, когда проверка не верна."));
       return function collect() {
         var check = { kind: kind.value };
         if (kind.value === "tag") {
@@ -522,7 +531,31 @@
       };
     }
   };
-  var KIND_FIELDS_ALL = ["text", "request_phone", "on_reply", "next", "duration", "duration_text", "check", "on_true", "on_false"];
+  // метка: буквы, цифры, нижнее подчёркивание (как clean_tags на сервере); негодное отбрасывается молча
+  function cleanTags(str) {
+    var out = [];
+    String(str).split(",").forEach(function (t) { t = t.trim(); if (/^[\p{L}\p{N}_]+$/u.test(t) && out.indexOf(t) < 0) out.push(t); });
+    return out;
+  }
+  STEP_FIELDS.tags = function (w, draft, box) {
+    var inp = textInput((w.tags || []).join(", "));
+    var shown = el("div", "tagline");
+    var paintTags = function () {
+      shown.textContent = "";
+      var list = cleanTags(inp.value);
+      if (!list.length) shown.appendChild(el("span", "hint", "Меток пока нет"));
+      list.forEach(function (t) { shown.appendChild(el("span", "tag", t)); });
+    };
+    inp.oninput = paintTags; paintTags();
+    box.appendChild(field("Метки через запятую", inp, "Буквы, цифры и _. Всё остальное отбрасывается — ниже видно, какие метки получились. Например: lead, funnel_msg_1_sent."));
+    box.appendChild(shown);
+    return function collect() {
+      var list = cleanTags(inp.value);
+      if (!list.length) return "Нужна хотя бы одна метка.";
+      return { tags: list };
+    };
+  };
+  var KIND_FIELDS_ALL = ["tags", "text", "request_phone", "on_reply", "next", "duration", "duration_text", "check", "on_true", "on_false"];
 
   function stepScreen(draft, idx, isNew, done, fresh) {
     var w = isNew ? clone(fresh) : clone(draft[idx]);      // новый шаг попадает в ленту только по «Готово»
@@ -608,6 +641,7 @@
         var payload = draft.map(function (s) {
           var o = { key: s.key, kind: s.kind };
           if (s.kind === "delay") o.duration = s.duration_text || "";
+          else if (s.kind === "tags") o.tags = s.tags;
           else if (s.kind === "condition") { o.check = s.check; o.on_true = s.on_true; o.on_false = s.on_false; }
           else {
             o.text = s.text;

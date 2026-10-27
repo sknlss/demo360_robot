@@ -75,14 +75,14 @@ class TestFunnelsPayload(Base):
         json.dumps(p, ensure_ascii=False)
         sig = next(f for f in p["funnels"] if f["key"] == "signup")
         self.assertTrue(sig["is_default"])
-        self.assertEqual([s["key"] for s in sig["steps"]], ["has_phone", "welcome", "ask", "d1", "m1", "d2", "m2", "already", "thanks", "declined"])
+        self.assertEqual([s["key"] for s in sig["steps"]], ["has_lead", "welcome", "ask", "d1", "m1", "d2", "m2", "already", "thanks", "set_lead", "declined"])
         ask = sig["steps"][2]
         self.assertEqual(ask["request_phone"], {"button": "дать", "decline_button": "нет"})
         self.assertEqual(ask["on_reply"], {"contact": "thanks", "decline": "declined"})
         self.assertEqual(sig["steps"][3]["duration"], 10.0)
         self.assertEqual(sig["steps"][3]["duration_text"], "10s")
         cond = sig["steps"][0]
-        self.assertEqual((cond["check"], cond["on_true"], cond["on_false"]), ({"kind": "phone_given"}, "already", "next"))
+        self.assertEqual((cond["check"], cond["on_true"], cond["on_false"]), ({"kind": "tag", "tag": "signup_lead"}, "already", "next"))
         self.assertEqual(cond["derived"]["exits"], {"on_true": "already", "on_false": "welcome"})   # «next» разрешён в ключ
         self.assertNotIn("entry_conditions", sig)
         self.assertEqual([l["key"] for l in sig["levels"]], ["started", "requested", "phone"])
@@ -91,14 +91,14 @@ class TestFunnelsPayload(Base):
         f = funnel_to_dict(self.cfg.funnel("signup"))
         thanks = next(s for s in f["steps"] if s["key"] == "thanks")
         self.assertEqual(thanks["derived"]["reached_by"], [{"step": "ask", "reply": "contact"}])
-        self.assertIsNone(thanks["derived"]["next_resolved"])
+        self.assertEqual(thanks["derived"]["next_resolved"], "set_lead")   # дальше шаг меток, за ним конец
         d1 = next(s for s in f["steps"] if s["key"] == "d1")
         self.assertEqual(d1["derived"]["next_resolved"], "m1")           # пауза ведёт на следующий по списку
         for src in ("key", "kind", "duration", "duration_text"):
             self.assertIn(src, d1)
         self.assertNotIn("next_resolved", d1)                # вычисленное только внутри derived
         already = next(s for s in f["steps"] if s["key"] == "already")
-        self.assertEqual(already["derived"]["reached_by"], [{"step": "has_phone", "reply": "on_true"}])
+        self.assertEqual(already["derived"]["reached_by"], [{"step": "has_lead", "reply": "on_true"}])
 
     def test_payload_has_no_phone_numbers(self):
         self.db.conn.execute("INSERT INTO users(tg_id,name,phone,created_at,tags) VALUES (5,'x','+37499111222',1,'[]')")

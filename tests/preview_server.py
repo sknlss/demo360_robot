@@ -69,7 +69,7 @@ def seed():
                                    ("run_cancelled", "повторный /start, отменено ждущих: 1"),
                                    ("phone_declined", None)]):
         db.log_event(t + k * 60, kind, k % 5 + 1, runs[k % 5 + 1], d)
-    db.log_event(t + 400, "condition", 1, runs[1], "has_phone: да → already")
+    db.log_event(t + 400, "condition", 1, runs[1], "has_lead: да → already")
     # конфиг лежит файлом (JSON — подмножество YAML), чтобы редактор писал в настоящий файл и бот-подобный
     # ConfigStore подхватывал правки; ruamel/PyYAML для предпросмотра не нужны
     path = os.path.join(tempfile.mkdtemp(), "funnels.json")

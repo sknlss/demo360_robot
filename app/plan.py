@@ -5,7 +5,8 @@
 """
 
 
-MAX_SILENT_STEPS = 20  # шагов без отправки (условий), которые бот проходит за один раз; страховка от зацикленного конфига
+SILENT_KINDS = ("condition", "tags")  # виды шагов, которые ничего не отправляют и проходятся насквозь
+MAX_SILENT_STEPS = 20  # шагов без отправки (условий и меток), которые бот проходит за один раз; страховка от зацикленного конфига
 
 
 def enqueue_step(conn, run_id: int, user_id: int, funnel, step, now: float):
@@ -28,20 +29,27 @@ def finish_run(conn, run_id: int, user_id: int, funnel_key: str, now: float, log
 
 
 def enter(conn, run_id: int, user_id: int, funnel, step, now: float, log_event, limit: int = None) -> str:
-    """Перейти на `step`. Условия вычисляются сразу и ничего не ставят в очередь; идём дальше, пока не упрёмся
-    в сообщение или задержку (ставим в очередь) или в конец (прогон завершается).
+    """Перейти на `step`. Условия и шаги меток выполняются сразу и ничего не ставят в очередь; идём дальше, пока
+    не упрёмся в сообщение или задержку (ставим в очередь) или в конец (прогон завершается).
 
-    Сверх `limit` условий за один раз прогон закрывается с причиной в журнале (`abort_run`).
+    Сверх `limit` таких шагов за один раз прогон закрывается с причиной в журнале (`abort_run`).
     Возвращает 'queued' | 'ended' | 'aborted'. Вызывать, когда у прогона нет открытой записи."""
     from .checks import evaluate
     limit = MAX_SILENT_STEPS if limit is None else limit
     passed = 0
-    while step is not None and step.kind == "condition":
+    while step is not None and step.kind in SILENT_KINDS:
         passed += 1
         if passed > limit:
             abort_run(conn, run_id, user_id, now,
-                      f"предел шагов без отправки ({limit}): условие '{step.key}' — конфиг зациклен?")
+                      f"предел шагов без отправки ({limit}): шаг '{step.key}' — конфиг зациклен?")
             return "aborted"
+        if step.kind == "tags":
+            from .service import add_tag
+            for t in step.tags:
+                add_tag(conn, user_id, t)           # повтор метки ничего не меняет
+            log_event(now, "tags_set", user_id, run_id, f"{step.key}: {', '.join(step.tags)}")
+            step = funnel.next_step(step)
+            continue
         result = evaluate(conn, user_id, funnel.key, step.check)
         target = funnel.exit_step(step, result)
         log_event(now, "condition", user_id, run_id,

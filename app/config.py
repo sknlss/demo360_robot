@@ -51,7 +51,7 @@ END = "end"    # значение `next` и выходов условия: пр�
 NEXT = "next"  # выход условия «следующий шаг по списку»; ключ шага так назвать нельзя
 RESERVED_KEYS = (END, NEXT)
 REPLY_OUTCOMES = ("contact", "decline")  # ответы человека, из которых делается ветвление
-CHECK_KINDS = ("phone_given", "tag")     # проверки условия; вычисляются в app/checks.py (там тот же набор)
+CHECK_KINDS = ("tag", "phone")     # проверки условия; вычисляются в app/checks.py (там тот же набор)
 
 
 @dataclass(frozen=True)
@@ -84,8 +84,8 @@ class DelayStep:
 
 @dataclass(frozen=True)
 class Check:
-    kind: str                                   # phone_given | tag
-    tag: Optional[str] = None                   # для tag: какая метка
+    kind: str                                   # tag | phone
+    tag: Optional[str] = None                   # для tag: какая метка (phone параметров не имеет)
 
 
 @dataclass(frozen=True)
@@ -99,6 +99,14 @@ class ConditionStep:
 
     def exit_for(self, result: bool) -> str:
         return self.on_true if result else self.on_false
+
+
+@dataclass(frozen=True)
+class TagsStep:
+    """Ставит метки пользователю. Ничего не отправляет, проходится насквозь, как условие; ведёт на следующий по списку."""
+    key: str
+    tags: tuple                                 # метки, как их ставит шаг
+    kind: str = "tags"
 
 
 @dataclass(frozen=True)
@@ -180,6 +188,25 @@ class Config:
         return self
 
 
+_TAG_RE = re.compile(r"\w+")  # буквы, цифры, подчёркивание (Unicode); пробелов, запятых, дефисов нет
+
+
+def is_valid_tag(tag) -> bool:
+    return isinstance(tag, str) and _TAG_RE.fullmatch(tag) is not None
+
+
+def clean_tags(value) -> list:
+    """Из строки через запятую или списка — только годные метки, без повторов, в исходном порядке.
+    Негодное молча отбрасывается (так ведёт себя редактор); разбор конфига вызывает его же и сверяет."""
+    items = value.split(",") if isinstance(value, str) else (value if isinstance(value, (list, tuple)) else [])
+    out = []
+    for t in items:
+        t = t.strip() if isinstance(t, str) else t
+        if is_valid_tag(t) and t not in out:
+            out.append(t)
+    return out
+
+
 def _req(d: dict, name: str, where: str, typ=str):
     if not isinstance(d, dict):
         raise ConfigError(f"{where}: ожидался словарь")
@@ -226,6 +253,10 @@ def _parse_delay(raw: dict, where: str) -> DelayStep:
 
 def _parse_check(raw, where: str) -> Check:
     kind = _req(raw, "kind", where)
+    if kind == "phone_given":
+        raise ConfigError(f"{where}.kind: проверка 'phone_given' убрана — она смотрела на метку, а не на номер. "
+                          f"Теперь две проверки: 'phone' (поле телефона у пользователя заполнено) и "
+                          f"'tag' с параметром tag (есть метка, например {{kind: tag, tag: signup_lead}})")
     if kind not in CHECK_KINDS:
         raise ConfigError(f"{where}.kind: неизвестная проверка '{kind}' (есть: {', '.join(CHECK_KINDS)})")
     if kind == "tag":
@@ -244,7 +275,17 @@ def _parse_condition(raw: dict, where: str) -> ConditionStep:
                          on_true=exits[0], on_false=exits[1])
 
 
-STEP_KINDS = {"message": _parse_message, "delay": _parse_delay, "condition": _parse_condition}
+def _parse_tags(raw: dict, where: str) -> TagsStep:
+    tags = raw.get("tags")
+    if not isinstance(tags, list) or not tags:
+        raise ConfigError(f"{where}.tags: нужен непустой список меток (например [lead, funnel_msg_1_sent])")
+    for t in tags:
+        if not is_valid_tag(t):
+            raise ConfigError(f"{where}.tags: метка {t!r} не годится — только буквы, цифры и нижнее подчёркивание")
+    return TagsStep(key=raw["key"], tags=tuple(dict.fromkeys(tags)))
+
+
+STEP_KINDS = {"message": _parse_message, "delay": _parse_delay, "condition": _parse_condition, "tags": _parse_tags}
 
 
 def _check_links(funnel: Funnel, where: str):
@@ -397,6 +438,8 @@ def step_to_dict(step, funnel: Optional[Funnel] = None) -> dict:
     elif step.kind == "delay":
         d["duration"] = step.duration
         d["duration_text"] = format_duration(step.duration)
+    elif step.kind == "tags":
+        d["tags"] = list(step.tags)
     else:
         d["check"] = {"kind": step.check.kind, **({"tag": step.check.tag} if step.check.tag else {})}
         d["on_true"], d["on_false"] = step.on_true, step.on_false

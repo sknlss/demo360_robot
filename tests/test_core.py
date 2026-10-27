@@ -30,11 +30,11 @@ from app.service import FunnelService, UserInfo, has_tag  # noqa: E402
 from app.worker import Worker  # noqa: E402
 
 def _funnel_raw():
-    """Поставляемая воронка в блоках: условие «номер оставлен» -> (да) «заявка у менеджера» / (нет) приветствие ->
-    запрос номера -> пауза 10 с -> напоминание -> пауза 1 мин -> напоминание; ответ уводит на «спасибо»/«отказ»."""
+    """Поставляемая воронка в блоках: условие «есть метка signup_lead» -> (да) «заявка у менеджера» / (нет) приветствие ->
+    запрос номера -> пауза 10 с -> напоминание -> пауза 1 мин -> напоминание; ответ уводит на «спасибо» (-> метки signup_lead -> конец) / «отказ»."""
     return {
         "steps": [
-            {"key": "has_phone", "kind": "condition", "check": {"kind": "phone_given"},
+            {"key": "has_lead", "kind": "condition", "check": {"kind": "tag", "tag": "signup_lead"},
              "on_true": "already", "on_false": "next"},
             {"key": "welcome", "kind": "message", "text": "привет"},
             {"key": "ask", "kind": "message", "text": "телефон?",
@@ -45,7 +45,8 @@ def _funnel_raw():
             {"key": "d2", "kind": "delay", "duration": "1m"},
             {"key": "m2", "kind": "message", "text": "второе", "next": "end"},
             {"key": "already", "kind": "message", "text": "ЗАЯВКА У МЕНЕДЖЕРА", "next": "end"},
-            {"key": "thanks", "kind": "message", "text": "спасибо", "next": "end"},
+            {"key": "thanks", "kind": "message", "text": "спасибо", "next": "set_lead"},
+            {"key": "set_lead", "kind": "tags", "tags": ["signup_lead"]},
             {"key": "declined", "kind": "message", "text": "ладно", "next": "end"},
         ],
     }
@@ -181,7 +182,7 @@ class TestStartCases(Base):
         self.assert_one_open()
 
     async def test_restart_after_phone_left_goes_through_condition_to_manager_message(self):
-        """Условие «номер оставлен» — первый шаг воронки. В чате всё как раньше: одно сообщение и конец.
+        """Условие «есть метка signup_lead» — первый шаг воронки. В чате всё как раньше: одно сообщение и конец.
         Единственное отличие от прежней модели: условие теперь шаг прогона, а сообщению нужен run_id,
         поэтому на такой /start создаётся короткий прогон, который сразу завершается."""
         await self.begin()
@@ -200,18 +201,30 @@ class TestStartCases(Base):
         await self.drain(advance=100)
         self.assertEqual(len(self.sender.sent), n_sent + 1)    # и больше ничего не пришло
         ev = self.q("SELECT details FROM events WHERE kind='condition' ORDER BY id DESC")[0]["details"]
-        self.assertEqual(ev, "has_phone: да → already")
+        self.assertEqual(ev, "has_lead: да → already")
 
-    async def test_start_while_thanks_run_is_active_goes_through_condition_too(self):
-        """Контакт пришёл, прогон ещё идёт (спасибо не ушло): повторный /start — обычный перезапуск; условие
-        видит номер и отвечает «заявка у менеджера». (Раньше /start тут блокировался до отмены прогона.)"""
+    async def test_restart_after_thanks_sent_sees_lead_tag(self):
+        """Прислал номер, «спасибо» ушло, шаг меток поставил signup_lead: повторный /start -> «заявка у менеджера»."""
         await self.begin()
         await self.svc.contact(111, "+37400000000", 111)
+        await self.drain()
+        self.assertTrue(has_tag(self.db.conn, 111, "signup_lead"))
+        n = len(self.sender.sent)
+        self.assertEqual(await self.svc.start(self.u), "new")
+        await self.drain()
+        self.assertEqual(self.sender.texts()[n:], ["ЗАЯВКА У МЕНЕДЖЕРА"])
+        self.assertEqual(self.q("SELECT * FROM queue WHERE status IN ('pending','processing')"), [])
+
+    async def test_restart_between_contact_and_thanks_starts_over(self):
+        """Контакт пришёл, но «спасибо» ещё не ушло и метку шаг меток не поставил: /start идёт с начала.
+        Номер при этом уже в поле телефона, поэтому проверка kind: phone в этом окне сработала бы."""
+        await self.begin()
+        await self.svc.contact(111, "+37400000000", 111)
+        self.assertFalse(has_tag(self.db.conn, 111, "signup_lead"))
         self.assertEqual(await self.svc.start(self.u), "restarted")
         await self.drain()
-        self.assertEqual(self.sender.texts()[-1], "ЗАЯВКА У МЕНЕДЖЕРА")
+        self.assertNotIn("ЗАЯВКА У МЕНЕДЖЕРА", self.sender.texts())
         self.assertNotIn("спасибо", self.sender.texts())
-        self.assertEqual(self.q("SELECT * FROM queue WHERE status IN ('pending','processing')"), [])
 
     async def test_restart_after_reminders_ran_out_without_answer_starts_over(self):
         await self.begin()
@@ -626,6 +639,10 @@ class TestConfig(unittest.TestCase):
         steps = {s.key: s for s in cfg.funnel("signup").steps}
         self.assertEqual((steps["wait_1"].duration, steps["wait_2"].duration), (10.0, 60.0))
         self.assertEqual(dict(steps["ask_phone"].on_reply), {"contact": "thanks", "decline": "declined"})
+        # воронка сама ставит метку и сама её проверяет
+        self.assertEqual((steps["has_lead"].check.kind, steps["has_lead"].check.tag), ("tag", "signup_lead"))
+        self.assertEqual(steps["set_lead"].tags, ("signup_lead",))
+        self.assertEqual(steps["thanks"].next, "set_lead")
 
 
 class TestLock(unittest.TestCase):
